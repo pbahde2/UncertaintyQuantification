@@ -7,10 +7,9 @@ include RMSE, NLL, CRPS, and coverage metrics.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 import numpy as np
-from scipy.special import erf
+from scipy.optimize import brentq
+from scipy.special import erf, logsumexp, ndtr, ndtri
 
 
 def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -56,7 +55,9 @@ def interval_coverage(y_true: np.ndarray, mean: np.ndarray, std: np.ndarray, lev
     float
         Fraction of true targets lying inside the nominal interval.
     """
-    z = 1.6448536269514722  # approx. quantile for 90% central normal interval
+    if not 0.0 < level < 1.0:
+        raise ValueError("level must lie strictly between 0 and 1")
+    z = float(ndtri((1.0 + level) / 2.0))
     lower = mean - z * std
     upper = mean + z * std
     covered = np.logical_and(y_true >= lower, y_true <= upper)

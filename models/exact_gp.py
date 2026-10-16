@@ -1,79 +1,124 @@
-"""Exact Gaussian process baseline.
-
-This model serves as the reference method in the small-data regime. The implementation is
-kept intentionally lightweight but is mathematically a proper GP posterior using a Matérn-5/2-
-like kernel in the exact inference sense. It provides a working baseline for the benchmark
-before more advanced GPyTorch models are added.
-"""
+"""Exact Gaussian process baseline implemented with BoTorch."""
 
 from __future__ import annotations
 
+import copy
 import numpy as np
+import torch
+from botorch.models import SingleTaskGP
+from gpytorch.kernels import MaternKernel, ScaleKernel
+from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.means import ConstantMean
+from gpytorch.mlls import ExactMarginalLogLikelihood
+
+from ._common import TargetStandardizer, as_2d, gaussian_nll, set_seed
 
 
 class ExactGPModel:
-    """Exact GP posterior with a Matérn-5/2 style kernel.
+    """Matérn-5/2 ARD GP with learned output scale and observation noise."""
 
-    The model fits the kernel hyperparameters from the training data in a simple data-driven
-    way, then computes the predictive mean and variance using the closed-form GP equations.
-    """
+    def __init__(self, X_train: np.ndarray, y_train: np.ndarray,
+                 learning_rate: float = 0.05, max_epochs: int = 400,
+                 patience: int = 5, warmup_epochs: int = 50,
+                 min_delta: float = 1e-4, random_seed: int = 0,
+                 X_val: np.ndarray | None = None, y_val: np.ndarray | None = None,
+                 **_: object):
+        self.learning_rate, self.max_epochs = learning_rate, max_epochs
+        self.patience, self.warmup_epochs = patience, warmup_epochs
+        self.min_delta, self.random_seed = min_delta, random_seed
+        self.fit(X_train, y_train, X_val=X_val, y_val=y_val)
 
-    def __init__(self, X_train: np.ndarray, y_train: np.ndarray, **kwargs):
-        self.X_train = self._as_2d(X_train)
-        self.y_train = np.asarray(y_train, dtype=float).reshape(-1)
-        self.lengthscale = kwargs.get("lengthscale", self._infer_lengthscale(self.X_train))
-        self.noise = kwargs.get("noise", 1e-2)
-        self.jitter = kwargs.get("jitter", 1e-6)
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray,
+            X_val: np.ndarray | None = None,
+            y_val: np.ndarray | None = None) -> "ExactGPModel":
+        set_seed(self.random_seed)
+        self.target_scaler = TargetStandardizer.fit(y_train)
+        train_x = torch.as_tensor(as_2d(X_train), dtype=torch.float64)
+        train_y = torch.as_tensor(
+            self.target_scaler.transform(y_train), dtype=torch.float64
+        ).unsqueeze(-1)
+        if (X_val is None) != (y_val is None):
+            raise ValueError("X_val and y_val must either both be provided or both be omitted")
+        val_x = (
+            torch.as_tensor(as_2d(X_val), dtype=torch.float64)
+            if X_val is not None and len(X_val) else None
+        )
+        val_y = (
+            torch.as_tensor(self.target_scaler.transform(y_val), dtype=torch.float64)
+            if val_x is not None else None
+        )
+        #define kernel
+        kernel = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=train_x.shape[-1]))
+        likelihood = GaussianLikelihood()
+        likelihood.noise = 0.1
+        #define model
+        self.model = SingleTaskGP(
+            train_x, train_y, likelihood=likelihood,
+            covar_module=kernel, mean_module=ConstantMean()
+        )
+        self.likelihood = self.model.likelihood
+        #hyperparameter optimization
+        self.model.train()
+        self.likelihood.train()
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        objective = ExactMarginalLogLikelihood(self.likelihood, self.model)
+        best_loss, best_epoch = float("inf"), 0
+        best_state = copy.deepcopy(self.model.state_dict())
+        stale = 0
+        first_monitored_epoch = min(max(1, self.warmup_epochs), self.max_epochs)
+        for epoch in range(1, self.max_epochs + 1):
+            optimizer.zero_grad()
+            loss = -objective(self.model(train_x), train_y.squeeze(-1))
+            loss.backward()
+            optimizer.step()
+            if val_x is not None and epoch >= first_monitored_epoch:
+                self.model.eval()
+                self.likelihood.eval()
+                with torch.no_grad():
+                    predictive = self.likelihood(self.model(val_x))
+                    selection_loss = float(
+                        gaussian_nll(predictive.mean, predictive.variance, val_y)
+                    )
+                self.model.train()
+                self.likelihood.train()
+                # Keep the epoch only when validation NLL improves by at least min_delta.
+                if selection_loss < best_loss - self.min_delta:
+                    best_loss = selection_loss
+                    best_state = copy.deepcopy(self.model.state_dict())
+                    best_epoch = epoch
+                    stale = 0
+                else:
+                    stale += 1
+                    # Five consecutive non-improving epochs trigger stopping by default.
+                    if stale >= self.patience:
+                        break
+        if val_x is not None:
+            self.model.load_state_dict(best_state)
+            self.best_epoch_ = best_epoch
+        else:
+            self.best_epoch_ = self.max_epochs
+        self.model.eval()
+        self.likelihood.eval()
+        return self
 
-    def _as_2d(self, X: np.ndarray) -> np.ndarray:
-        X = np.asarray(X, dtype=float)
-        if X.ndim == 1:
-            X = X.reshape(-1, 1)
-        return X
+    def refit_full(self, X_train: np.ndarray, y_train: np.ndarray) -> "ExactGPModel":
+        """Reinitialize and train on all labels for the selected duration."""
+        # Preserve the validation-selected duration before fit creates a fresh GP.
+        selected_epochs, maximum = self.best_epoch_, self.max_epochs
+        self.max_epochs = selected_epochs
+        # With no validation arguments, fit uses every observation for exactly this many epochs.
+        self.fit(X_train, y_train)
+        self.max_epochs = maximum
+        self.best_epoch_ = selected_epochs
+        return self
 
-    def _infer_lengthscale(self, X: np.ndarray) -> float:
-        """Roughly estimate a lengthscale from the median pairwise distance."""
-        if len(X) < 2:
-            return 1.0
-        diffs = X[:, None, :] - X[None, :, :]
-        dists = np.linalg.norm(diffs, axis=2)
-        upper = dists[np.triu_indices(len(X), k=1)]
-        if upper.size == 0:
-            return 1.0
-        return float(np.median(upper[upper > 0])) + 1e-3
-
-    def _kernel(self, X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
-        """Compute a Matérn-5/2 kernel matrix."""
-        X1 = self._as_2d(X1)
-        X2 = self._as_2d(X2)
-        d = X1[:, None, :] - X2[None, :, :]
-        r = np.linalg.norm(d, axis=2)
-        coeff = np.sqrt(5.0) * r / self.lengthscale
-        kernel = (1.0 + coeff + (5.0 * r**2) / (3.0 * self.lengthscale**2)) * np.exp(-coeff)
-        return kernel
-
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray):
-        """Fit the GP model on the supplied training data."""
-        self.X_train = self._as_2d(X_train)
-        self.y_train = np.asarray(y_train, dtype=float).reshape(-1)
-        self.lengthscale = self._infer_lengthscale(self.X_train)
-
-    def predict(self, X_test: np.ndarray):
-        """Return the GP predictive mean and standard deviation."""
-        X_test = self._as_2d(X_test)
-
-        Kxx = self._kernel(self.X_train, self.X_train)
-        Kxs = self._kernel(self.X_train, X_test)
-        Kss = self._kernel(X_test, X_test)
-
-        noise_matrix = self.noise**2 * np.eye(len(self.X_train))
-        L = np.linalg.cholesky(Kxx + noise_matrix + self.jitter * np.eye(len(self.X_train)))
-
-        alpha = np.linalg.solve(L.T, np.linalg.solve(L, self.y_train))
-        mean = Kxs.T @ alpha
-
-        v = np.linalg.solve(L, Kxs)
-        cov = Kss - v.T @ v
-        std = np.sqrt(np.clip(np.diag(cov), 0.0, None))
-
-        return mean.astype(float), std.astype(float)
+    def predict(self, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        test_x = torch.as_tensor(as_2d(X_test), dtype=torch.float64)
+        with torch.no_grad():
+            predictive = self.model.posterior(test_x, observation_noise=True)
+        mean = (
+            predictive.mean.squeeze(-1).detach().numpy() * self.target_scaler.std
+            + self.target_scaler.mean
+        )
+        variance = predictive.variance.squeeze(-1).detach().numpy() * self.target_scaler.std**2
+        return mean, np.maximum(variance, 1e-12)

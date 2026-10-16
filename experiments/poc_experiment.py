@@ -17,8 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from benchmark import benchmark_models
-from data_preparation import standardize_features
+from execute_experiment import execute_experiment
 from models.deep_ensemble import DeepEnsembleModel
 from models.dkl import DKLModel
 from models.exact_gp import ExactGPModel
@@ -36,36 +35,46 @@ def synthetic_regression_dataset(dataset_name: str = "synthetic", random_seed: i
     X = rng.uniform(-3.0, 3.0, size=(300, 1))
     y = np.sin(X[:, 0]) + 0.3 * X[:, 0] + 0.2 * rng.normal(size=len(X))
 
-    X_train, X_test, y_train, y_test = X[:240], X[240:], y[:240], y[240:]
-    X_train_scaled, X_test_scaled, _ = standardize_features(X_train, X_test)
-
     return {
-        "X_train": X_train_scaled,
-        "X_test": X_test_scaled,
-        "y_train": y_train,
-        "y_test": y_test,
+        "X_train": X[:240],
+        "X_test": X[240:],
+        "y_train": y[:240],
+        "y_test": y[240:],
     }
 
 
-def main() -> None:
+def poc_experiment() -> None:
     """Run a compact benchmark comparing all five model families."""
     model_factories = {
-        "exact_gp": lambda X_train, y_train: ExactGPModel(X_train, y_train),
-        "sparse_gp": lambda X_train, y_train: SparseGPModel(X_train, y_train, n_inducing=32),
-        "deep_ensemble": lambda X_train, y_train: DeepEnsembleModel(X_train, y_train, n_members=5),
-        "mc_dropout": lambda X_train, y_train: MCDropoutModel(X_train, y_train, n_samples=25),
-        "dkl": lambda X_train, y_train: DKLModel(X_train, y_train),
+        "exact_gp": lambda X_train, y_train, **kwargs: ExactGPModel(X_train, y_train, **kwargs),
+        "sparse_gp_m16": lambda X_train, y_train, **kwargs: SparseGPModel(
+            X_train, y_train, n_inducing=16, **kwargs
+        ),
+        "sparse_gp_m64": lambda X_train, y_train, **kwargs: SparseGPModel(
+            X_train, y_train, n_inducing=64, **kwargs
+        ),
+        "sparse_gp_m256": lambda X_train, y_train, **kwargs: SparseGPModel(
+            X_train, y_train, n_inducing=256, **kwargs
+        ),
+        "deep_ensemble": lambda X_train, y_train, **kwargs: DeepEnsembleModel(
+            X_train, y_train, n_members=5, **kwargs
+        ),
+        "mc_dropout": lambda X_train, y_train, **kwargs: MCDropoutModel(
+            X_train, y_train, n_samples=25, **kwargs
+        ),
+        "dkl": lambda X_train, y_train, **kwargs: DKLModel(X_train, y_train, **kwargs),
     }
 
-    result_df = benchmark_models(
+    result_df = execute_experiment(
         model_factories=model_factories,
         dataset_names=["synthetic"],
         train_sizes=[25, 50, 100, 150],
         n_splits=3,
         dataset_loader=synthetic_regression_dataset,
+        verbose=True,
     )
 
-    output_path = ROOT / "results" / "tables" / "synthetic_small_data_benchmark.csv"
+    output_path = ROOT / "results" / "tables" / "poc_experiment.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result_df.to_csv(output_path, index=False)
 
@@ -78,8 +87,8 @@ def main() -> None:
 
     print(summary)
     print(f"\nSaved benchmark table to: {output_path}")
-    print("\nAll five models were benchmarked successfully.")
+    print("\nAll five model families (seven configurations) were benchmarked successfully.")
 
 
 if __name__ == "__main__":
-    main()
+    poc_experiment()

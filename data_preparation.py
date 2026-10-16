@@ -7,7 +7,7 @@ for a benchmark study comparing Gaussian processes, deep ensembles, MC dropout, 
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 from sklearn.datasets import fetch_openml
@@ -124,6 +124,57 @@ def subsample_training_data(
     return X_train[idx], y_train[idx]
 
 
+def nested_training_subsets(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    train_sizes: Iterable[int],
+    random_seed: int = 0,
+) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+    """Create reproducible nested subsets from one random ordering.
+
+    Every smaller requested subset is a prefix of every larger requested subset.
+    This reduces learning-curve noise caused by independently resampling each size.
+    """
+    sizes = [int(size) for size in train_sizes]
+    if any(size <= 0 for size in sizes):
+        raise ValueError("all training sizes must be positive")
+    X = np.asarray(X_train)
+    y = np.asarray(y_train)
+    if len(X) != len(y):
+        raise ValueError("X_train and y_train must contain the same number of observations")
+    order = np.random.default_rng(random_seed).permutation(len(X))
+    return {
+        size: (X[order[: min(size, len(X))]], y[order[: min(size, len(y))]])
+        for size in sizes
+    }
+
+
+def split_train_validation(
+    X: np.ndarray,
+    y: np.ndarray,
+    validation_fraction: float = 0.2,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split an ordered subset while preserving nesting across subset sizes.
+
+    Validation positions are selected by a deterministic fractional schedule. Therefore,
+    extending a prefix never changes the role of an observation already present.
+    """
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be in [0, 1)")
+    X = np.asarray(X)
+    y = np.asarray(y)
+    if len(X) != len(y):
+        raise ValueError("X and y must contain the same number of observations")
+    positions = np.arange(len(X))
+    validation_mask = (
+        np.floor((positions + 1) * validation_fraction)
+        > np.floor(positions * validation_fraction)
+    )
+    if np.all(validation_mask):
+        validation_mask[-1] = False
+    return X[~validation_mask], X[validation_mask], y[~validation_mask], y[validation_mask]
+
+
 def prepare_dataset_for_benchmark(
     dataset_name: str,
     train_fraction: float = 0.8,
@@ -146,7 +197,7 @@ def prepare_dataset_for_benchmark(
     Returns
     -------
     dict
-        Dictionary containing the processed arrays:
+        Dictionary containing the raw split arrays:
         {'X_train': ..., 'X_test': ..., 'y_train': ..., 'y_test': ...}
     """
     X, y = load_uci_regression_dataset(dataset_name)
@@ -166,11 +217,9 @@ def prepare_dataset_for_benchmark(
             random_seed=random_seed,
         )
 
-    X_train_scaled, X_test_scaled, _ = standardize_features(X_train, X_test)
-
     return {
-        "X_train": X_train_scaled,
-        "X_test": X_test_scaled,
+        "X_train": X_train,
+        "X_test": X_test,
         "y_train": y_train,
         "y_test": y_test,
     }
@@ -181,5 +230,7 @@ __all__ = [
     "standardize_features",
     "create_train_test_split",
     "subsample_training_data",
+    "nested_training_subsets",
+    "split_train_validation",
     "prepare_dataset_for_benchmark",
 ]

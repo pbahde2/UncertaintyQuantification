@@ -5,7 +5,14 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from ._common import GaussianMLP, TargetStandardizer, as_2d, set_seed, train_gaussian_network
+from ._common import (
+    TORCH_DTYPE,
+    GaussianMLP,
+    TargetStandardizer,
+    as_2d,
+    set_seed,
+    train_gaussian_network,
+)
 
 
 class MCDropoutModel:
@@ -60,7 +67,7 @@ class MCDropoutModel:
         return self
 
     def predict_components(self, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        X = torch.as_tensor(as_2d(X_test), dtype=torch.float32)
+        X = torch.as_tensor(as_2d(X_test), dtype=TORCH_DTYPE)
         self.model.train()  # dropout intentionally remains active
         means, variances = [], []
         generator_state = torch.random.get_rng_state()

@@ -6,9 +6,11 @@ import inspect
 import unittest
 
 import numpy as np
+import torch
 
 from metrics import compute_regression_metrics
 from models import DKLModel, DeepEnsembleModel, ExactGPModel, MCDropoutModel, SparseGPModel
+from models._common import TORCH_DTYPE, GaussianMLP
 
 
 class ModelSmokeTests(unittest.TestCase):
@@ -50,6 +52,47 @@ class ModelSmokeTests(unittest.TestCase):
             self.assertEqual(parameters["max_epochs"].default, 400)
             self.assertEqual(parameters["warmup_epochs"].default, 50)
             self.assertEqual(parameters["patience"].default, 5)
+
+    def test_neural_models_use_two_equal_width_hidden_layers(self):
+        network = GaussianMLP(input_dim=3)
+        self.assertEqual(network.hidden1.in_features, 3)
+        self.assertEqual(network.hidden1.out_features, 6)
+        self.assertEqual(network.hidden2.in_features, 6)
+        self.assertEqual(network.hidden2.out_features, 6)
+
+        model = DKLModel(
+            self.X[:8], self.y[:8], max_epochs=1,
+            X_val=self.X[8:], y_val=self.y[8:],
+        )
+        linear_layers = [
+            layer for layer in model.model.feature_extractor.network
+            if isinstance(layer, torch.nn.Linear)
+        ]
+        self.assertEqual(
+            [(layer.in_features, layer.out_features) for layer in linear_layers],
+            [(2, 4), (4, 4), (4, 2)],
+        )
+        self.assertEqual(model.feature_dim, self.X.shape[1])
+
+    def test_all_models_use_shared_precision(self):
+        validation = {"X_val": self.X[8:], "y_val": self.y[8:]}
+        models = [
+            ExactGPModel(self.X[:8], self.y[:8], max_epochs=1, **validation),
+            SparseGPModel(
+                self.X[:8], self.y[:8], n_inducing=4, max_epochs=1, **validation
+            ),
+            DeepEnsembleModel(
+                self.X[:8], self.y[:8], n_members=2, max_epochs=1, **validation
+            ),
+            MCDropoutModel(
+                self.X[:8], self.y[:8], n_samples=2, max_epochs=1, **validation
+            ),
+            DKLModel(self.X[:8], self.y[:8], max_epochs=1, **validation),
+        ]
+        for model in models:
+            modules = model.members if hasattr(model, "members") else [model.model]
+            for module in modules:
+                self.assertEqual({p.dtype for p in module.parameters()}, {TORCH_DTYPE})
 
     def test_sparse_gp_keeps_selection_capacity_during_full_refit(self):
         model = SparseGPModel(

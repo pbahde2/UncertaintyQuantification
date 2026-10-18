@@ -11,8 +11,14 @@ import torch
 from torch import nn
 
 
+# Use one numerical precision across GP and neural-network methods so runtime and
+# predictive comparisons are not confounded by float32 versus float64 arithmetic.
+NUMPY_DTYPE = np.float64
+TORCH_DTYPE = torch.float64
+
+
 def as_2d(X: np.ndarray) -> np.ndarray:
-    X = np.asarray(X, dtype=np.float32)
+    X = np.asarray(X, dtype=NUMPY_DTYPE)
     return X.reshape(-1, 1) if X.ndim == 1 else X
 
 
@@ -29,26 +35,28 @@ class TargetStandardizer:
 
     @classmethod
     def fit(cls, y: np.ndarray) -> "TargetStandardizer":
-        y = np.asarray(y, dtype=np.float32).reshape(-1)
+        y = np.asarray(y, dtype=NUMPY_DTYPE).reshape(-1)
         std = float(np.std(y))
         return cls(float(np.mean(y)), std if std > 1e-8 else 1.0)
 
     def transform(self, y: np.ndarray) -> np.ndarray:
-        return (np.asarray(y, dtype=np.float32) - self.mean) / self.std
+        return (np.asarray(y, dtype=NUMPY_DTYPE) - self.mean) / self.std
 
 
 class GaussianMLP(nn.Module):
-    """One-hidden-layer MLP producing a Gaussian mean and variance."""
+    """Two-hidden-layer MLP producing a Gaussian mean and variance."""
 
     def __init__(self, input_dim: int, dropout: float = 0.0):
         super().__init__()
         width = max(2, 2 * input_dim)
-        self.hidden = nn.Linear(input_dim, width)
+        self.hidden1 = nn.Linear(input_dim, width, dtype=TORCH_DTYPE)
+        self.hidden2 = nn.Linear(width, width, dtype=TORCH_DTYPE)
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(width, 2)
+        self.head = nn.Linear(width, 2, dtype=TORCH_DTYPE)
 
     def forward(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden = self.dropout(torch.relu(self.hidden(X)))
+        hidden = self.dropout(torch.relu(self.hidden1(X)))
+        hidden = self.dropout(torch.relu(self.hidden2(hidden)))
         mean, raw_variance = self.head(hidden).chunk(2, dim=-1)
         variance = torch.nn.functional.softplus(raw_variance) + 1e-6
         return mean.squeeze(-1), variance.squeeze(-1)
@@ -77,8 +85,10 @@ def train_gaussian_network(
 ) -> int:
     """Train using Gaussian NLL and retain the best validation checkpoint."""
     set_seed(seed)
-    X_tensor = torch.as_tensor(as_2d(X), dtype=torch.float32)
-    y_tensor = torch.as_tensor(np.asarray(y, dtype=np.float32).reshape(-1))
+    X_tensor = torch.as_tensor(as_2d(X), dtype=TORCH_DTYPE)
+    y_tensor = torch.as_tensor(
+        np.asarray(y, dtype=NUMPY_DTYPE).reshape(-1), dtype=TORCH_DTYPE
+    )
     generator = torch.Generator().manual_seed(seed)
     # During final retraining, use every observation and disable validation stopping.
     if fixed_epochs is not None:
@@ -91,8 +101,10 @@ def train_gaussian_network(
         raise ValueError("X_val and y_val must either both be provided or both be omitted")
     elif X_val is not None and len(X_val):
         train_idx = torch.arange(len(X_tensor))
-        X_val_tensor = torch.as_tensor(as_2d(X_val), dtype=torch.float32)
-        y_val_tensor = torch.as_tensor(np.asarray(y_val, dtype=np.float32).reshape(-1))
+        X_val_tensor = torch.as_tensor(as_2d(X_val), dtype=TORCH_DTYPE)
+        y_val_tensor = torch.as_tensor(
+            np.asarray(y_val, dtype=NUMPY_DTYPE).reshape(-1), dtype=TORCH_DTYPE
+        )
         epochs = max_epochs
     else:
         order = torch.randperm(len(X_tensor), generator=generator)

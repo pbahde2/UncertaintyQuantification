@@ -26,6 +26,31 @@ from data_preparation import (
 from metrics import compute_regression_metrics
 
 
+@dataclass(frozen=True)
+class ModelSpec:
+    """A model factory plus protocol metadata used before the model is trained."""
+
+    factory: Callable[..., Any]
+    n_inducing: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.n_inducing is not None and self.n_inducing <= 0:
+            raise ValueError("n_inducing must be a positive integer")
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self.n_inducing is not None:
+            configured_count = kwargs.setdefault("n_inducing", self.n_inducing)
+            if configured_count != self.n_inducing:
+                raise ValueError(
+                    "Factory call n_inducing does not match the ModelSpec metadata"
+                )
+        return self.factory(*args, **kwargs)
+
+    def supports_train_size(self, train_size: int) -> bool:
+        """Return whether this configuration belongs in the requested benchmark row."""
+        return self.n_inducing is None or train_size > self.n_inducing
+
+
 @dataclass
 class ExperimentConfig:
     """Configuration for a single experiment run.
@@ -40,6 +65,27 @@ class ExperimentConfig:
     random_seed: int = 0
     test_fraction: float = 0.2
     validation_fraction: float = 0.2
+
+
+def count_experiment_jobs(
+    model_factories: Dict[str, Callable[..., Any]],
+    train_sizes: Iterable[int],
+    n_datasets: int = 1,
+    n_splits: int = 1,
+) -> int:
+    """Count scheduled runs after applying model-specific protocol constraints."""
+    runs_per_split = sum(
+        _supports_train_size(model_factory, train_size)
+        for train_size in train_sizes
+        for model_factory in model_factories.values()
+    )
+    return n_datasets * n_splits * runs_per_split
+
+
+def _supports_train_size(model_factory: Callable[..., Any], train_size: int) -> bool:
+    """Apply optional scheduling metadata while retaining plain-callable compatibility."""
+    supports_train_size = getattr(model_factory, "supports_train_size", None)
+    return supports_train_size is None or bool(supports_train_size(train_size))
 
 
 def _format_duration(seconds: float) -> str:
@@ -147,7 +193,9 @@ def execute_experiment(
     loader = dataset_loader or prepare_dataset_for_benchmark
     dataset_names = list(dataset_names)
     train_sizes = list(train_sizes)
-    total_jobs = len(dataset_names) * n_splits * len(train_sizes) * len(model_factories)
+    total_jobs = count_experiment_jobs(
+        model_factories, train_sizes, n_datasets=len(dataset_names), n_splits=n_splits
+    )
     completed_jobs = 0
     experiment_start = time.perf_counter()
     if verbose:
@@ -181,6 +229,10 @@ def execute_experiment(
                 X_full_scaled, X_final_test_scaled, _ = standardize_features(X_sub, X_test)
 
                 for model_name, model_factory in model_factories.items():
+                    # An SVGP is only a sparse approximation when the training set is
+                    # strictly larger than its requested inducing-point set.
+                    if not _supports_train_size(model_factory, train_size):
+                        continue
                     # Stage 1: early-stop on validation NLL to determine the training duration.
                     job_number = completed_jobs + 1
                     if verbose:
@@ -222,7 +274,7 @@ def execute_experiment(
                         # Backward-compatible path for external models without refitting support.
                         final_training_time_seconds = np.nan
                         evaluation_X = X_test_scaled
-                    # For SVGP rows, record the post-cap count used by the final full-data model.
+                    # For SVGP rows, record the inducing count used by the final full-data model.
                     effective_inducing = float(getattr(model, "n_inducing_", np.nan))
                     result = evaluate_trained_model(model, evaluation_X, y_test, model_name)
                     rows.append(
@@ -254,7 +306,9 @@ def execute_experiment(
 
 
 __all__ = [
+    "ModelSpec",
     "ExperimentConfig",
+    "count_experiment_jobs",
     "run_single_experiment",
     "evaluate_trained_model",
     "execute_experiment",

@@ -7,40 +7,7 @@ predictions and where classical Gaussian processes may remain competitive with n
 
 ## Motivation and research questions
 
-Regression models often need to communicate not only what they predict, but also how uncertain
-that prediction is. This matters in settings such as scientific modeling, engineering, and
-decision-making, where labeled data can be expensive and an overconfident error may be more harmful
-than an imprecise prediction.
 
-Gaussian processes (GPs) provide a probabilistic model with principled uncertainty estimates and
-are especially attractive for small datasets. Their exact form, however, scales cubically with the
-number of training observations. Neural approaches such as deep ensembles and Monte Carlo dropout
-scale more naturally to larger datasets, but their uncertainty estimates may be poorly calibrated
-when data are scarce. Deep kernel learning (DKL) attempts to combine learned neural features with a
-GP, raising the question of whether it preserves GP-like uncertainty behavior.
-
-The intended study therefore asks:
-
-1. At what training-set size does an exact GP stop being the strongest practical baseline?
-2. Which method provides the best balance of predictive accuracy and calibrated uncertainty?
-3. How much quality is lost when an exact GP is replaced by a sparse approximation?
-4. Does DKL behave more like a GP or an overconfident neural model in the small-data regime?
-5. How do these conclusions change in interpolation and extrapolation settings?
-
-## Current state of development
-
-The repository contains an executable end-to-end benchmark on a synthetic one-dimensional
-regression problem. The data pipeline, shared model interface, repeated experiment loop, metrics,
-CSV export, and basic plotting helpers are implemented.
-
-All five model families now have trained PyTorch/BoTorch/GPyTorch implementations. The GP methods share a
-Matérn-5/2 ARD kernel, constant mean, learned output scale, and learned Gaussian observation noise.
-The neural methods share a one-hidden-layer architecture and heteroscedastic Gaussian head. Deep
-ensemble and MC-dropout predictions are moment-matched to a univariate Gaussian for evaluation.
-
-The benchmark is still an early research implementation: broader datasets, systematic
-hyperparameter selection, runtime measurements, and repeated interpolation/extrapolation studies
-remain to be added before drawing scientific conclusions.
 
 ## Quickstart
 
@@ -78,22 +45,47 @@ python -u experiments/concrete_experiment.py
 ```
 
 It evaluates training sizes 50, 100, 200, 400, 800, and 1,000 over 10 reproducible splits,
-for a total of 420 model runs. Because the dataset contains 1,030 rows, each split uses exactly
+for a total of 380 eligible model runs. Because the dataset contains 1,030 rows, each split uses exactly
 1,000 rows as the nested training pool and 30 held-out rows for testing. Results are written to
 `results/tables/concrete_experiment.csv`. The dataset is downloaded once and cached under
 `.cache/scikit_learn/`.
 
-### Combined Cycle Power Plant experiment
+### Main experiment
 
-The larger real-data experiment uses UCI dataset 294 with an 80/20 train/test split:
+The main experiment compares UCI Combined Cycle Power Plant (ID 294) and Protein Tertiary
+Structure (ID 265) using separate reproducible 80/20 train/test splits:
 
 ```bash
 python -u experiments/power_plant_experiment.py
 ```
 
-It evaluates training sizes 50, 100, 200, 400, 800, and 1,600 over 20 reproducible
-splits. With seven model configurations, this produces 840 model runs. Results are written
-to `results/tables/power_plant_experiment.csv`.
+It evaluates training sizes 50, 100, 200, 400, 800, and 1,600 over 20 splits per dataset.
+Only sparse-GP configurations with fewer inducing points than training observations are run.
+This produces 1,520 eligible runs in one result file:
+`results/tables/power_plant_experiment.csv`.
+
+### Power Plant and Electrical Grid Stability experiment
+
+A separate experiment replaces Protein Structure with UCI Electrical Grid Stability (ID 471)
+while retaining Power Plant and the same training sizes, splits, models, and sparse-GP eligibility
+rule:
+
+```bash
+python -u experiments/power_plant_grid_stability_experiment.py
+```
+
+Electrical Grid Stability uses the continuous `stab` target and drops the documented
+non-predictive `p1` field, leaving 11 numerical inputs. This run writes to
+`results/tables/power_plant_grid_stability_experiment.csv`; it does not overwrite the existing
+Power Plant/Protein results in `results/tables/power_plant_experiment.csv`.
+
+#### Dataset choice
+
+The two datasets create a controlled contrast between a four-feature engineering problem and a
+nine-feature biological problem. Power Plant provides a low-dimensional setting in which exact
+GPs should be strong, while Protein Structure tests whether sparse GPs and learned neural features
+become more useful as dimensionality and functional complexity increase. Both have numerical
+inputs, continuous targets, no missing values, and enough observations for an identical protocol.
 
 ## Experimental approach
 
@@ -156,9 +148,16 @@ mean, variance = model.predict(X_test)
 | MC dropout | Inexpensive approximate Bayesian neural baseline using stochastic inference passes | Heteroscedastic MLP with dropout active over repeated inference passes |
 | DKL | Combine learned neural representations with a probabilistic GP head | Jointly trained neural feature extractor and exact Matérn-5/2 GP head |
 
+All methods use float64. Neural models have two equal-width hidden layers, and DKL preserves the
+input dimension in its learned feature space.
+
 The exact GP and DKL use the full training covariance matrix, which is appropriate for the
 small-data focus but will become expensive as the dataset grows. The public NumPy-array interface
 keeps the benchmark independent of the internal PyTorch implementation.
+
+Sparse GPs are evaluated only when the requested training size is strictly larger than the
+configuration's inducing-point count. This avoids treating a full-size inducing set as a sparse
+approximation and prevents duplicate capped configurations at small training sizes.
 
 ### Metrics
 
@@ -190,7 +189,7 @@ The generated CSV contains these columns:
 | `train_size` | Requested number of training observations |
 | `model` | Model identifier |
 | `selected_epoch` | Validation-selected duration used for full-subset retraining (member mean for ensembles) |
-| `n_inducing` | Effective inducing-point count for SVGP rows after capping; missing otherwise |
+| `n_inducing` | Inducing-point count used for eligible SVGP rows; missing otherwise |
 | `final_training_time_seconds` | Model reinitialization and training time on the complete subset; excludes epoch selection and feature scaling |
 | `inference_time_seconds` | Predictive-distribution computation time; excludes metric calculation |
 | `rmse` | Root mean squared error |
@@ -298,8 +297,7 @@ the final model.
 
 ### Root files
 
-- **`README.md`** — explains the research motivation, experimental design, current state, and
-  usage of the repository.
+- **`README.md`** — explains the research motivation, experimental design, and usage.
 - **`LICENSE`** — contains the MIT license under which the project is distributed.
 - **`requirements.txt`** — lists runtime and development dependencies. NumPy, SciPy, pandas,
   scikit-learn, Matplotlib, and seaborn support the benchmark and metrics; PyTorch, BoTorch, and
@@ -327,7 +325,7 @@ The model package defines the common set of uncertainty-aware regressors:
 - **`models/sparse_gp.py`** — wraps BoTorch's variational `SingleTaskVariationalGP` baseline.
 - **`models/deep_ensemble.py`** — trains independent heteroscedastic Gaussian MLP members.
 - **`models/mc_dropout.py`** — trains the shared MLP architecture and samples with dropout active.
-- **`models/dkl.py`** — jointly trains a four-dimensional neural feature map and exact GP.
+- **`models/dkl.py`** — jointly trains a dimension-preserving neural feature map and exact GP.
 
 ### `experiments/`
 
@@ -345,16 +343,6 @@ This folder holds generated experiment artifacts:
 
 A dedicated plot-output folder is not currently used because the plotting functions display
 figures rather than saving them.
-
-## Known limitations and next steps
-
-Further planned work includes:
-
-1. adding curated UCI/OpenML dataset configurations;
-2. extending validation from checkpoint selection to a documented hyperparameter search space;
-3. recording training and inference time;
-4. reporting aggregate uncertainty across more repeated splits; and
-5. adding calibration and extrapolation diagnostics.
 
 ## License
 

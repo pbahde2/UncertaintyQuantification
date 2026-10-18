@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from execute_experiment import execute_experiment
+from execute_experiment import ModelSpec, execute_experiment
 from models.deep_ensemble import DeepEnsembleModel
 from models.dkl import DKLModel
 from models.exact_gp import ExactGPModel
@@ -47,15 +47,9 @@ def poc_experiment() -> None:
     """Run a compact benchmark comparing all five model families."""
     model_factories = {
         "exact_gp": lambda X_train, y_train, **kwargs: ExactGPModel(X_train, y_train, **kwargs),
-        "sparse_gp_m16": lambda X_train, y_train, **kwargs: SparseGPModel(
-            X_train, y_train, n_inducing=16, **kwargs
-        ),
-        "sparse_gp_m64": lambda X_train, y_train, **kwargs: SparseGPModel(
-            X_train, y_train, n_inducing=64, **kwargs
-        ),
-        "sparse_gp_m256": lambda X_train, y_train, **kwargs: SparseGPModel(
-            X_train, y_train, n_inducing=256, **kwargs
-        ),
+        "sparse_gp_m16": ModelSpec(SparseGPModel, n_inducing=16),
+        "sparse_gp_m64": ModelSpec(SparseGPModel, n_inducing=64),
+        "sparse_gp_m256": ModelSpec(SparseGPModel, n_inducing=256),
         "deep_ensemble": lambda X_train, y_train, **kwargs: DeepEnsembleModel(
             X_train, y_train, n_members=5, **kwargs
         ),
@@ -87,7 +81,7 @@ def poc_experiment() -> None:
 
     print(summary)
     print(f"\nSaved benchmark table to: {output_path}")
-    print("\nAll five model families (seven configurations) were benchmarked successfully.")
+    print("\nAll eligible model configurations were benchmarked successfully.")
 
 
 if __name__ == "__main__":

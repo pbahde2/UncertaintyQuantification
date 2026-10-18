@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from execute_experiment import execute_experiment
+from execute_experiment import ModelSpec, count_experiment_jobs, execute_experiment
 from models.deep_ensemble import DeepEnsembleModel
 from models.dkl import DKLModel
 from models.exact_gp import ExactGPModel
@@ -92,15 +92,9 @@ def concrete_experiment() -> None:
         "exact_gp": lambda X_train, y_train, **kwargs: ExactGPModel(
             X_train, y_train, **kwargs
         ),
-        "sparse_gp_m16": lambda X_train, y_train, **kwargs: SparseGPModel(
-            X_train, y_train, n_inducing=16, **kwargs
-        ),
-        "sparse_gp_m64": lambda X_train, y_train, **kwargs: SparseGPModel(
-            X_train, y_train, n_inducing=64, **kwargs
-        ),
-        "sparse_gp_m256": lambda X_train, y_train, **kwargs: SparseGPModel(
-            X_train, y_train, n_inducing=256, **kwargs
-        ),
+        "sparse_gp_m16": ModelSpec(SparseGPModel, n_inducing=16),
+        "sparse_gp_m64": ModelSpec(SparseGPModel, n_inducing=64),
+        "sparse_gp_m256": ModelSpec(SparseGPModel, n_inducing=256),
         "deep_ensemble": lambda X_train, y_train, **kwargs: DeepEnsembleModel(
             X_train, y_train, n_members=5, **kwargs
         ),
@@ -118,7 +112,7 @@ def concrete_experiment() -> None:
         f"{TEST_SIZE} held-out test rows per split\n"
         f"Training sizes: {TRAIN_SIZES}\n"
         f"Total model runs: "
-        f"{N_SPLITS * len(TRAIN_SIZES) * len(model_factories)}",
+        f"{count_experiment_jobs(model_factories, TRAIN_SIZES, n_splits=N_SPLITS)}",
         flush=True,
     )
 

@@ -11,7 +11,7 @@ from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.means import ConstantMean
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
-from ._common import TargetStandardizer, as_2d, gaussian_nll, set_seed
+from ._common import TORCH_DTYPE, TargetStandardizer, as_2d, gaussian_nll, set_seed
 
 
 class ExactGPModel:
@@ -33,18 +33,18 @@ class ExactGPModel:
             y_val: np.ndarray | None = None) -> "ExactGPModel":
         set_seed(self.random_seed)
         self.target_scaler = TargetStandardizer.fit(y_train)
-        train_x = torch.as_tensor(as_2d(X_train), dtype=torch.float64)
+        train_x = torch.as_tensor(as_2d(X_train), dtype=TORCH_DTYPE)
         train_y = torch.as_tensor(
-            self.target_scaler.transform(y_train), dtype=torch.float64
+            self.target_scaler.transform(y_train), dtype=TORCH_DTYPE
         ).unsqueeze(-1)
         if (X_val is None) != (y_val is None):
             raise ValueError("X_val and y_val must either both be provided or both be omitted")
         val_x = (
-            torch.as_tensor(as_2d(X_val), dtype=torch.float64)
+            torch.as_tensor(as_2d(X_val), dtype=TORCH_DTYPE)
             if X_val is not None and len(X_val) else None
         )
         val_y = (
-            torch.as_tensor(self.target_scaler.transform(y_val), dtype=torch.float64)
+            torch.as_tensor(self.target_scaler.transform(y_val), dtype=TORCH_DTYPE)
             if val_x is not None else None
         )
         #define kernel
@@ -113,7 +113,7 @@ class ExactGPModel:
         return self
 
     def predict(self, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        test_x = torch.as_tensor(as_2d(X_test), dtype=torch.float64)
+        test_x = torch.as_tensor(as_2d(X_test), dtype=TORCH_DTYPE)
         with torch.no_grad():
             predictive = self.model.posterior(test_x, observation_noise=True)
         mean = (

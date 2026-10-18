@@ -7,11 +7,46 @@ import unittest
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
-from execute_experiment import execute_experiment
+from execute_experiment import ModelSpec, count_experiment_jobs, execute_experiment
 from data_preparation import nested_training_subsets, split_train_validation
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_sparse_models_run_only_above_their_inducing_point_count(self):
+        trained_sizes = []
+
+        class Recorder:
+            def __init__(self, X_train, y_train, **kwargs):
+                trained_sizes.append(len(X_train) + len(kwargs["X_val"]))
+
+            def predict(self, X_test):
+                return np.zeros(len(X_test)), np.ones(len(X_test))
+
+        factories = {
+            "baseline": lambda X, y, **kwargs: Recorder(X, y, **kwargs),
+            "sparse_gp_m5": ModelSpec(
+                lambda X, y, **kwargs: Recorder(X, y, **kwargs), n_inducing=5
+            ),
+        }
+        result = execute_experiment(
+            factories,
+            ["toy"],
+            [4, 5, 6],
+            n_splits=1,
+            validation_fraction=0.25,
+            dataset_loader=lambda name, random_seed=0: {
+                "X_train": np.arange(8, dtype=float).reshape(-1, 1),
+                "y_train": np.arange(8, dtype=float),
+                "X_test": np.array([[8.0]]),
+                "y_test": np.array([8.0]),
+            },
+        )
+
+        sparse_rows = result[result["model"] == "sparse_gp_m5"]
+        self.assertEqual(sparse_rows["train_size"].tolist(), [6])
+        self.assertEqual(count_experiment_jobs(factories, [4, 5, 6]), 4)
+        self.assertEqual(trained_sizes, [4, 5, 6, 6])
+
     def test_subsets_and_validation_roles_remain_nested(self):
         X = np.arange(30, dtype=float).reshape(-1, 1)
         y = np.arange(30)

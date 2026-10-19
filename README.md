@@ -191,16 +191,19 @@ The generated CSV contains these columns:
 | `selected_epoch` | Validation-selected duration used for full-subset retraining (member mean for ensembles) |
 | `n_inducing` | Inducing-point count used for eligible SVGP rows; missing otherwise |
 | `final_training_time_seconds` | Model reinitialization and training time on the complete subset; excludes epoch selection and feature scaling |
-| `inference_time_seconds` | Predictive-distribution computation time; excludes metric calculation |
+| `inference_time_seconds` | Median predictive-distribution computation time over 20 calls after 3 warm-up calls; excludes metric calculation |
 | `rmse` | Root mean squared error |
 | `nll` | Mean Gaussian negative log-likelihood |
 | `crps` | Mean Gaussian CRPS |
 | `coverage_90` | Empirical coverage of the nominal 90% interval |
 
 The command-line script saves all individual rows but prints metric means grouped by model and
-training size. Timing uses a monotonic high-resolution wall clock. In particular, the reported
-training time covers only final full-subset training and never includes validation-based epoch
-selection. The proof-of-concept script also prints phase-level progress, elapsed time, and a
+training size. Timing uses a monotonic high-resolution wall clock. Inference timing uses three
+untimed warm-up predictions followed by 20 measured predictions and stores their median; metric
+calculation is excluded. The first warm-up prediction supplies the values used for evaluation, so
+the repeated benchmark does not change which stochastic MC-dropout prediction is scored. The
+reported training time covers only final full-subset training and never includes validation-based
+epoch selection. The proof-of-concept script also prints phase-level progress, elapsed time, and a
 rolling ETA after every completed model run; epoch-selection timing is shown only as progress
 information and is not stored as training time.
 

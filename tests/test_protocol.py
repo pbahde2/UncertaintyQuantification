@@ -3,15 +3,46 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
-from execute_experiment import ModelSpec, count_experiment_jobs, execute_experiment
+from execute_experiment import (
+    ModelSpec,
+    count_experiment_jobs,
+    evaluate_trained_model,
+    execute_experiment,
+)
 from data_preparation import nested_training_subsets, split_train_validation
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_inference_time_is_median_after_warmup_calls(self):
+        class CountingModel:
+            def __init__(self):
+                self.predict_calls = 0
+
+            def predict(self, X_test):
+                self.predict_calls += 1
+                return np.zeros(len(X_test)), np.ones(len(X_test))
+
+        model = CountingModel()
+        # Three timed durations: 3, 1, and 2 seconds, whose median is 2.
+        clock_values = [0.0, 3.0, 10.0, 11.0, 20.0, 22.0]
+        with patch("execute_experiment.time.perf_counter", side_effect=clock_values):
+            result = evaluate_trained_model(
+                model,
+                np.array([[0.0], [1.0]]),
+                np.array([0.0, 0.0]),
+                "counting_model",
+                inference_warmup_runs=2,
+                inference_timing_repeats=3,
+            )
+
+        self.assertEqual(model.predict_calls, 5)
+        self.assertEqual(result["inference_time_seconds"], 2.0)
+
     def test_sparse_models_run_only_above_their_inducing_point_count(self):
         trained_sizes = []
 

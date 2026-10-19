@@ -26,6 +26,10 @@ from data_preparation import (
 from metrics import compute_regression_metrics
 
 
+DEFAULT_INFERENCE_WARMUP_RUNS = 3
+DEFAULT_INFERENCE_TIMING_REPEATS = 20
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     """A model factory plus protocol metadata used before the model is trained."""
@@ -157,12 +161,34 @@ def evaluate_trained_model(
     X_test: np.ndarray,
     y_test: np.ndarray,
     model_name: str,
+    inference_warmup_runs: int = DEFAULT_INFERENCE_WARMUP_RUNS,
+    inference_timing_repeats: int = DEFAULT_INFERENCE_TIMING_REPEATS,
 ) -> Dict[str, Any]:
-    """Evaluate an already-trained model whose prediction API returns variance."""
-    # Time prediction only; metric computation below is intentionally excluded.
-    inference_start = time.perf_counter()
+    """Evaluate a trained model and benchmark prediction using repeated timings.
+
+    The first prediction is retained for metric calculation and also serves as the first
+    untimed warm-up. Additional warm-ups stabilize lazy initialization and caches. The
+    reported inference time is the median of the subsequent prediction calls; metric
+    calculation is intentionally excluded.
+    """
+    if inference_warmup_runs < 1:
+        raise ValueError("inference_warmup_runs must be at least 1")
+    if inference_timing_repeats < 1:
+        raise ValueError("inference_timing_repeats must be at least 1")
+
+    # Preserve the first prediction for metrics so repeated timing does not change which
+    # stochastic MC-dropout draw is evaluated relative to the previous protocol.
     mean, variance = model.predict(X_test)
-    inference_time_seconds = time.perf_counter() - inference_start
+    for _ in range(inference_warmup_runs - 1):
+        model.predict(X_test)
+
+    inference_durations = np.empty(inference_timing_repeats, dtype=float)
+    for repeat_idx in range(inference_timing_repeats):
+        inference_start = time.perf_counter()
+        model.predict(X_test)
+        inference_durations[repeat_idx] = time.perf_counter() - inference_start
+    inference_time_seconds = float(np.median(inference_durations))
+
     std = np.sqrt(np.maximum(variance, 1e-12))
     metrics = compute_regression_metrics(y_test, mean, std)
     return {
@@ -180,6 +206,8 @@ def execute_experiment(
     validation_fraction: float = 0.2,
     dataset_loader: Optional[Callable[[str], Dict[str, np.ndarray]]] = None,
     verbose: bool = False,
+    inference_warmup_runs: int = DEFAULT_INFERENCE_WARMUP_RUNS,
+    inference_timing_repeats: int = DEFAULT_INFERENCE_TIMING_REPEATS,
 ) -> pd.DataFrame:
     """Run the experiment across datasets, training sizes, and model families.
 
@@ -199,7 +227,12 @@ def execute_experiment(
     completed_jobs = 0
     experiment_start = time.perf_counter()
     if verbose:
-        print(f"Starting {total_jobs} model runs...", flush=True)
+        print(
+            f"Starting {total_jobs} model runs...\n"
+            f"Inference timing: median of {inference_timing_repeats} calls after "
+            f"{inference_warmup_runs} warm-up calls.",
+            flush=True,
+        )
 
     # For every dataset
     for dataset_name in dataset_names:
@@ -276,7 +309,14 @@ def execute_experiment(
                         evaluation_X = X_test_scaled
                     # For SVGP rows, record the inducing count used by the final full-data model.
                     effective_inducing = float(getattr(model, "n_inducing_", np.nan))
-                    result = evaluate_trained_model(model, evaluation_X, y_test, model_name)
+                    result = evaluate_trained_model(
+                        model,
+                        evaluation_X,
+                        y_test,
+                        model_name,
+                        inference_warmup_runs=inference_warmup_runs,
+                        inference_timing_repeats=inference_timing_repeats,
+                    )
                     rows.append(
                         {
                             "dataset": dataset_name,
@@ -312,4 +352,6 @@ __all__ = [
     "run_single_experiment",
     "evaluate_trained_model",
     "execute_experiment",
+    "DEFAULT_INFERENCE_WARMUP_RUNS",
+    "DEFAULT_INFERENCE_TIMING_REPEATS",
 ]

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from ._common import (
+    DEFAULT_LEARNING_RATE,
     TORCH_DTYPE,
     GaussianMLP,
     TargetStandardizer,
@@ -17,7 +18,8 @@ from ._common import (
 
 class MCDropoutModel:
     def __init__(self, X_train: np.ndarray, y_train: np.ndarray, n_samples: int = 5,
-                 dropout_probability: float = 0.1, learning_rate: float = 1e-3,
+                 dropout_probability: float = 0.1,
+                 learning_rate: float = DEFAULT_LEARNING_RATE,
                  max_epochs: int = 400, batch_size: int = 32, patience: int = 5,
                  warmup_epochs: int = 50, min_delta: float = 1e-4,
                  validation_fraction: float = 0.2, random_seed: int = 0,
@@ -45,24 +47,6 @@ class MCDropoutModel:
             warmup_epochs=self.warmup_epochs, min_delta=self.min_delta,
             validation_fraction=self.validation_fraction, seed=self.random_seed,
             X_val=X_val, y_val=y_val_scaled,
-        )
-        return self
-
-    def refit_full(self, X_train: np.ndarray, y_train: np.ndarray) -> "MCDropoutModel":
-        """Reinitialize and train on all labels for the selected duration."""
-        # Preserve the validation-selected duration before replacing the selection model.
-        epochs = self.best_epoch_
-        X = as_2d(X_train)
-        self.target_scaler = TargetStandardizer.fit(y_train)
-        y = self.target_scaler.transform(y_train)
-        set_seed(self.random_seed)
-        # Create a fresh network so validation observations enter only the final full-data fit.
-        self.model = GaussianMLP(X.shape[1], dropout=self.dropout_probability)
-        train_gaussian_network(
-            self.model, X, y, learning_rate=self.learning_rate, max_epochs=epochs,
-            batch_size=self.batch_size, patience=self.patience,
-            warmup_epochs=self.warmup_epochs, min_delta=self.min_delta,
-            validation_fraction=0.0, seed=self.random_seed, fixed_epochs=epochs,
         )
         return self
 

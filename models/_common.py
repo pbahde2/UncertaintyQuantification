@@ -15,6 +15,7 @@ from torch import nn
 # predictive comparisons are not confounded by float32 versus float64 arithmetic.
 NUMPY_DTYPE = np.float64
 TORCH_DTYPE = torch.float64
+DEFAULT_LEARNING_RATE = 0.01
 
 
 def as_2d(X: np.ndarray) -> np.ndarray:
@@ -81,7 +82,6 @@ def train_gaussian_network(
     seed: int,
     X_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
-    fixed_epochs: int | None = None,
 ) -> int:
     """Train using Gaussian NLL and retain the best validation checkpoint."""
     set_seed(seed)
@@ -90,14 +90,7 @@ def train_gaussian_network(
         np.asarray(y, dtype=NUMPY_DTYPE).reshape(-1), dtype=TORCH_DTYPE
     )
     generator = torch.Generator().manual_seed(seed)
-    # During final retraining, use every observation and disable validation stopping.
-    if fixed_epochs is not None:
-        if fixed_epochs <= 0:
-            raise ValueError("fixed_epochs must be positive")
-        train_idx = torch.arange(len(X_tensor))
-        X_val_tensor = y_val_tensor = None
-        epochs = fixed_epochs
-    elif (X_val is None) != (y_val is None):
+    if (X_val is None) != (y_val is None):
         raise ValueError("X_val and y_val must either both be provided or both be omitted")
     elif X_val is not None and len(X_val):
         train_idx = torch.arange(len(X_tensor))
@@ -134,9 +127,6 @@ def train_gaussian_network(
             loss.backward()
             optimizer.step()
 
-        # Fixed-duration retraining deliberately performs no validation checks.
-        if fixed_epochs is not None:
-            continue
         if epoch < first_monitored_epoch:
             continue
         model.eval()
@@ -152,7 +142,5 @@ def train_gaussian_network(
             # Stop after the configured number of consecutive non-improving epochs.
             if stale >= patience:
                 break
-    if fixed_epochs is not None:
-        return fixed_epochs
     model.load_state_dict(best_state)
     return best_epoch

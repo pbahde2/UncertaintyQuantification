@@ -11,14 +11,21 @@ from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.means import ConstantMean
 from gpytorch.mlls import VariationalELBO
 
-from ._common import TORCH_DTYPE, TargetStandardizer, as_2d, gaussian_nll, set_seed
+from ._common import (
+    DEFAULT_LEARNING_RATE,
+    TORCH_DTYPE,
+    TargetStandardizer,
+    as_2d,
+    gaussian_nll,
+    set_seed,
+)
 
 
 class SparseGPModel:
     """SVGP with learned inducing locations and a Gaussian likelihood."""
 
     def __init__(self, X_train: np.ndarray, y_train: np.ndarray, n_inducing: int = 64,
-                 learning_rate: float = 0.01, max_epochs: int = 400,
+                 learning_rate: float = DEFAULT_LEARNING_RATE, max_epochs: int = 400,
                  patience: int = 5, warmup_epochs: int = 50,
                  min_delta: float = 1e-4, random_seed: int = 0,
                  X_val: np.ndarray | None = None, y_val: np.ndarray | None = None,
@@ -104,25 +111,6 @@ class SparseGPModel:
             self.best_epoch_ = self.max_epochs
         self.model.eval()
         self.likelihood.eval()
-        return self
-
-    def refit_full(self, X_train: np.ndarray, y_train: np.ndarray) -> "SparseGPModel":
-        """Reinitialize and train on all labels for the selected duration."""
-        # Preserve both validation-selected duration and model capacity. In particular,
-        # do not increase the inducing-point count merely because validation observations
-        # rejoin the final training set.
-        selected_epochs = self.best_epoch_
-        effective_inducing = self.n_inducing_
-        maximum, requested_inducing = self.max_epochs, self.n_inducing
-        self.max_epochs = selected_epochs
-        self.n_inducing = effective_inducing
-        try:
-            # With no validation arguments, fit uses every observation for exactly this many epochs.
-            self.fit(X_train, y_train)
-        finally:
-            self.max_epochs = maximum
-            self.n_inducing = requested_inducing
-        self.best_epoch_ = selected_epochs
         return self
 
     def predict(self, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

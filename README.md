@@ -35,6 +35,26 @@ results/tables/poc_experiment.csv
 The synthetic experiment works without downloading data. Internet access is required only when
 the OpenML loader in `data_preparation.py` is used.
 
+### Experiment 2: out-of-distribution uncertainty
+
+Experiment 2 runs the same seven model configurations as Experiment 1 over 20 seeds in two OOD
+settings. The synthetic setting trains on 300 noisy samples from
+`y = sin(1.5x) + epsilon` with inputs in `[-3, 3]` and evaluates 1,000 evenly spaced test inputs
+over `[-5, 5]`. All hidden layers in its Deep Ensemble, MC Dropout, and DKL configurations use
+four units. The real-data setting partitions the Combined Cycle Power Plant observations by
+PC1, using the middle 80% as ID data and both 10% tails as OOD data. Each seed uses 400 ID fitting
+observations and 80 separate ID validation observations.
+
+```bash
+python -u experiments/experiment_2.py
+```
+
+RMSE, NLL, CRPS, 90% coverage, and mean predicted uncertainty (the mean predictive standard
+deviation) are reported separately for ID and OOD observations. The command writes per-seed results
+to `results/tables/experiment_2.csv`, aggregate mean and standard deviation results to
+`results/tables/experiment_2_summary.csv`, and one synthetic prediction figure per model to
+`results/figures/experiment_2/`.
+
 ### Concrete Compressive Strength experiment
 
 The real-data experiment uses the verified OpenML copy (data ID 44959) of the UCI Concrete
@@ -44,8 +64,8 @@ Compressive Strength dataset:
 python -u experiments/concrete_experiment.py
 ```
 
-It evaluates training sizes 50, 100, 200, 400, 800, and 1,000 over 10 reproducible splits,
-for a total of 380 eligible model runs. Because the dataset contains 1,030 rows, each split uses exactly
+It evaluates training sizes 50, 100, 200, 400, and 800 over 10 reproducible splits,
+for a total of 310 eligible model runs. Because the dataset contains 1,030 rows, each split uses exactly
 1,000 rows as the nested training pool and 30 held-out rows for testing. Results are written to
 `results/tables/concrete_experiment.csv`. The dataset is downloaded once and cached under
 `.cache/scikit_learn/`.
@@ -67,17 +87,20 @@ This produces 1,520 eligible runs in one result file:
 ### Power Plant and Electrical Grid Stability experiment
 
 A separate experiment replaces Protein Structure with UCI Electrical Grid Stability (ID 471)
-while retaining Power Plant and the same training sizes, splits, models, and sparse-GP eligibility
+while retaining Power Plant, the same training sizes and models, and the sparse-GP eligibility
 rule:
 
 ```bash
-python -u experiments/power_plant_grid_stability_experiment.py
+python -u experiments/experiment_1.py
 ```
 
 Electrical Grid Stability uses the continuous `stab` target and drops the documented
 non-predictive `p1` field, leaving 11 numerical inputs. This run writes to
-`results/tables/power_plant_grid_stability_experiment.csv`; it does not overwrite the existing
+`results/tables/experiment_1.csv`; it does not overwrite the existing
 Power Plant/Protein results in `results/tables/power_plant_experiment.csv`.
+
+This experiment uses five splits. Deep Ensemble and MC Dropout use learning rate `0.001`;
+Exact GP, Sparse GP, and DKL use `0.01`.
 
 #### Dataset choice
 
@@ -99,14 +122,14 @@ The benchmark follows this sequence:
 1. Load or generate a regression dataset.
 2. Divide it into a training pool and a held-out test set.
 3. Generate one reproducibly shuffled training-pool ordering per split.
-4. Form every requested training size as a prefix of that ordering, producing nested subsets.
-5. Assign stable model-fit and validation roles within each prefix (80%/20% by default).
+4. Form nested fitting sets containing exactly each requested `train_size`.
+5. Add a separate nested validation set containing `ceil(0.2 * train_size)` observations.
 6. Fit feature standardization only on the model-fit partition and transform validation/test data.
-7. Select a training duration using validation NLL and a minimum improvement of `1e-4`.
+7. Train once, retaining the best checkpoint according to validation NLL and a minimum improvement
+   of `1e-4`.
    Every method uses the same 50-epoch warm-up, patience 5, and 400-epoch ceiling for
    validation-based early stopping.
-8. Reinitialize the model and feature scaler, then train on the entire requested subset for the
-   selected number of epochs.
+8. Evaluate that retained checkpoint directly; no second training run is performed.
 9. Predict a mean and variance for every test observation.
 10. Calculate accuracy and uncertainty metrics and store one row per model, split, and size.
 
@@ -118,7 +141,7 @@ The default sweep uses:
 | Total observations per split | 300 |
 | Training/test pool | 240/60 observations |
 | Training subset sizes | 25, 50, 100, 150 |
-| Model-fit/validation fraction | 80%/20% within each training subset |
+| Additional validation size | 20% of the fitting size, rounded up |
 | Repeated seeds | 3 |
 | Model families/configurations | 5/7 |
 | Result rows | 84 |
@@ -149,7 +172,8 @@ mean, variance = model.predict(X_test)
 | DKL | Combine learned neural representations with a probabilistic GP head | Jointly trained neural feature extractor and exact Matérn-5/2 GP head |
 
 All methods use float64. Neural models have two equal-width hidden layers, and DKL preserves the
-input dimension in its learned feature space.
+input dimension in its learned feature space. All five model classes share a default learning
+rate of `0.01`; callers can still explicitly override it when running a separate tuning study.
 
 The exact GP and DKL use the full training covariance matrix, which is appropriate for the
 small-data focus but will become expensive as the dataset grows. The public NumPy-array interface
@@ -176,7 +200,7 @@ a probabilistic score in the target's units and is generally less dominated by i
 overconfident predictions. Coverage checks whether prediction intervals achieve their stated
 frequency, although coverage alone does not reward narrow intervals.
 
-The benchmark records wall-clock time for final full-data training and test-set inference.
+The benchmark records wall-clock time for the early-stopped training run and test-set inference.
 
 ### Result format
 
@@ -188,9 +212,9 @@ The generated CSV contains these columns:
 | `split` | Repetition/seed index |
 | `train_size` | Requested number of training observations |
 | `model` | Model identifier |
-| `selected_epoch` | Validation-selected duration used for full-subset retraining (member mean for ensembles) |
+| `selected_epoch` | Best validation epoch (member mean for ensembles) |
 | `n_inducing` | Inducing-point count used for eligible SVGP rows; missing otherwise |
-| `final_training_time_seconds` | Model reinitialization and training time on the complete subset; excludes epoch selection and feature scaling |
+| `final_training_time_seconds` | Complete early-stopped training time for the evaluated checkpoint |
 | `inference_time_seconds` | Median predictive-distribution computation time over 20 calls after 3 warm-up calls; excludes metric calculation |
 | `rmse` | Root mean squared error |
 | `nll` | Mean Gaussian negative log-likelihood |
@@ -202,10 +226,9 @@ training size. Timing uses a monotonic high-resolution wall clock. Inference tim
 untimed warm-up predictions followed by 20 measured predictions and stores their median; metric
 calculation is excluded. The first warm-up prediction supplies the values used for evaluation, so
 the repeated benchmark does not change which stochastic MC-dropout prediction is scored. The
-reported training time covers only final full-subset training and never includes validation-based
-epoch selection. The proof-of-concept script also prints phase-level progress, elapsed time, and a
-rolling ETA after every completed model run; epoch-selection timing is shown only as progress
-information and is not stored as training time.
+reported training time covers the complete model fit, including validation checks. The
+proof-of-concept script also prints phase-level progress, elapsed time, and a rolling ETA after
+every completed model run.
 
 ### Plotting
 
@@ -264,10 +287,9 @@ the validation data, test data, or larger training subsets. Model factories rece
 `y_val`, and `random_seed` keyword arguments, so custom factories should accept and forward
 `**kwargs`.
 
-Each model standardizes the model-fit targets during epoch selection. Before final evaluation, it
-is reinitialized, standardizes all targets in the requested subset, and trains on all of them for
-the selected duration. Consequently, `train_size` is the number of observations actually used by
-the final model.
+Each model standardizes targets using only the fitting observations. `train_size` directly counts
+those fitting observations; the additional validation observations select the checkpoint but are
+never incorporated into parameter fitting.
 
 ## Project structure
 

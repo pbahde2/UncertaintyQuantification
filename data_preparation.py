@@ -15,6 +15,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 
+VALIDATION_RATIO = 0.2
+
+
 def load_uci_regression_dataset(name: str, version: str | None = None) -> Tuple[np.ndarray, np.ndarray]:
     """Load a UCI regression dataset.
 
@@ -124,55 +127,54 @@ def subsample_training_data(
     return X_train[idx], y_train[idx]
 
 
-def nested_training_subsets(
+def nested_fit_validation_subsets(
     X_train: np.ndarray,
     y_train: np.ndarray,
     train_sizes: Iterable[int],
     random_seed: int = 0,
-) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-    """Create reproducible nested subsets from one random ordering.
+) -> Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Create nested fitting sets with additional, disjoint validation data.
 
-    Every smaller requested subset is a prefix of every larger requested subset.
-    This reduces learning-curve noise caused by independently resampling each size.
+    Each requested size is the exact number of observations used to fit a model.
+    Its validation set contains ``ceil(size * VALIDATION_RATIO)`` additional
+    observations. Fitting and validation observations come from separate prefixes
+    of one reproducible permutation, so their roles remain disjoint and nested as
+    the requested fitting size grows.
     """
     sizes = [int(size) for size in train_sizes]
+    if not sizes:
+        return {}
     if any(size <= 0 for size in sizes):
         raise ValueError("all training sizes must be positive")
     X = np.asarray(X_train)
     y = np.asarray(y_train)
     if len(X) != len(y):
         raise ValueError("X_train and y_train must contain the same number of observations")
+
+    validation_sizes = {
+        size: int(np.ceil(size * VALIDATION_RATIO)) for size in sizes
+    }
+    max_fit_size = max(sizes)
+    max_validation_size = max(validation_sizes.values())
+    required_size = max_fit_size + max_validation_size
+    if required_size > len(X):
+        raise ValueError(
+            f"requested {max_fit_size} fitting and {max_validation_size} validation "
+            f"observations, but only {len(X)} are available"
+        )
+
     order = np.random.default_rng(random_seed).permutation(len(X))
+    fit_order = order[:max_fit_size]
+    validation_order = order[max_fit_size:required_size]
     return {
-        size: (X[order[: min(size, len(X))]], y[order[: min(size, len(y))]])
+        size: (
+            X[fit_order[:size]],
+            X[validation_order[:validation_sizes[size]]],
+            y[fit_order[:size]],
+            y[validation_order[:validation_sizes[size]]],
+        )
         for size in sizes
     }
-
-
-def split_train_validation(
-    X: np.ndarray,
-    y: np.ndarray,
-    validation_fraction: float = 0.2,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Split an ordered subset while preserving nesting across subset sizes.
-
-    Validation positions are selected by a deterministic fractional schedule. Therefore,
-    extending a prefix never changes the role of an observation already present.
-    """
-    if not 0.0 <= validation_fraction < 1.0:
-        raise ValueError("validation_fraction must be in [0, 1)")
-    X = np.asarray(X)
-    y = np.asarray(y)
-    if len(X) != len(y):
-        raise ValueError("X and y must contain the same number of observations")
-    positions = np.arange(len(X))
-    validation_mask = (
-        np.floor((positions + 1) * validation_fraction)
-        > np.floor(positions * validation_fraction)
-    )
-    if np.all(validation_mask):
-        validation_mask[-1] = False
-    return X[~validation_mask], X[validation_mask], y[~validation_mask], y[validation_mask]
 
 
 def prepare_dataset_for_benchmark(
@@ -227,10 +229,10 @@ def prepare_dataset_for_benchmark(
 
 __all__ = [
     "load_uci_regression_dataset",
+    "VALIDATION_RATIO",
     "standardize_features",
     "create_train_test_split",
     "subsample_training_data",
-    "nested_training_subsets",
-    "split_train_validation",
+    "nested_fit_validation_subsets",
     "prepare_dataset_for_benchmark",
 ]

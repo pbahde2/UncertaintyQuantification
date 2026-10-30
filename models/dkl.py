@@ -8,7 +8,14 @@ import torch
 from torch import nn
 import gpytorch
 
-from ._common import TORCH_DTYPE, TargetStandardizer, as_2d, gaussian_nll, set_seed
+from ._common import (
+    DEFAULT_LEARNING_RATE,
+    TORCH_DTYPE,
+    TargetStandardizer,
+    as_2d,
+    gaussian_nll,
+    set_seed,
+)
 
 
 class _FeatureExtractor(nn.Module):
@@ -46,7 +53,7 @@ class _DKLGP(gpytorch.models.ExactGP):
 
 class DKLModel:
     def __init__(self, X_train: np.ndarray, y_train: np.ndarray,
-                 learning_rate: float = 0.01, max_epochs: int = 400,
+                 learning_rate: float = DEFAULT_LEARNING_RATE, max_epochs: int = 400,
                  patience: int = 5, warmup_epochs: int = 50,
                  min_delta: float = 1e-4, random_seed: int = 0,
                  X_val: np.ndarray | None = None, y_val: np.ndarray | None = None,
@@ -120,17 +127,6 @@ class DKLModel:
             self.best_epoch_ = self.max_epochs
         self.model.eval()
         self.likelihood.eval()
-        return self
-
-    def refit_full(self, X_train: np.ndarray, y_train: np.ndarray) -> "DKLModel":
-        """Reinitialize and train on all labels for the selected duration."""
-        # Preserve the validation-selected duration before fit creates a fresh DKL model.
-        selected_epochs, maximum = self.best_epoch_, self.max_epochs
-        self.max_epochs = selected_epochs
-        # With no validation arguments, fit uses every observation for exactly this many epochs.
-        self.fit(X_train, y_train)
-        self.max_epochs = maximum
-        self.best_epoch_ = selected_epochs
         return self
 
     def predict(self, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

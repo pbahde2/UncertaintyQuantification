@@ -44,12 +44,25 @@ class TargetStandardizer:
         return (np.asarray(y, dtype=NUMPY_DTYPE) - self.mean) / self.std
 
 
+def resolve_hidden_size(input_dim: int, hidden_size: int | None) -> int:
+    """Return an explicit hidden width or the benchmark's dimension-based default."""
+    width = max(2, 2 * input_dim) if hidden_size is None else int(hidden_size)
+    if width <= 0:
+        raise ValueError("hidden_size must be positive")
+    return width
+
+
 class GaussianMLP(nn.Module):
     """Two-hidden-layer MLP producing a Gaussian mean and variance."""
 
-    def __init__(self, input_dim: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_size: int | None = None,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        width = max(2, 2 * input_dim)
+        width = resolve_hidden_size(input_dim, hidden_size)
         self.hidden1 = nn.Linear(input_dim, width, dtype=TORCH_DTYPE)
         self.hidden2 = nn.Linear(width, width, dtype=TORCH_DTYPE)
         self.dropout = nn.Dropout(dropout)

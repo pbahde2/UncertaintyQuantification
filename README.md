@@ -1,308 +1,158 @@
 # Uncertainty Quantification in Small-Data Regression
 
-This project is an experimental framework for comparing uncertainty-aware regression models when
-only a small number of labeled observations are available. It focuses on the regime from a few
-dozen to a few hundred training examples, where uncertainty estimates can be as important as point
-predictions and where classical Gaussian processes may remain competitive with neural methods.
+## Overview
 
-## Motivation and research questions
+This repository accompanies a study of predictive uncertainty in small-data regression. It compares Gaussian-process and neural-network-based uncertainty quantification methods under a reproducible experimental protocol.
 
+The comparison consists of two experiments. The first investigates how increasing training set size affects predictive accuracy, uncertainty quality, and computational efficiency across two real-world regression datasets. The second examines how the methods behave under out-of-distribution (OOD) inputs, focusing on predictive performance and uncertainty calibration using both synthetic and real-world data.
 
+The experiments compare an exact Gaussian process, three sparse Gaussian-process configurations,
+a deep ensemble, Monte Carlo dropout, and deep kernel learning. All models return a predictive
+mean and variance and are evaluated with RMSE, Gaussian negative log-likelihood (NLL), Gaussian
+CRPS, and empirical coverage of a nominal 90% prediction interval. For the first experiment inference and training-wall-clock-time are measured.
 
 ## Quickstart
 
-Python 3.10-3.12 is recommended (PyTorch wheel availability may lag behind new Python releases).
+Python 3.10--3.12 is recommended. Run all commands from the repository root.
 
 ```bash
-git clone https://github.com/pbahde2/UncertaintyQuantification.git
-cd UncertaintyQuantification
-
 python3 -m venv .venv
 source .venv/bin/activate
-
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python experiments/poc_experiment.py
 ```
 
-The command runs the default synthetic experiment, prints results averaged across splits, and
-writes the complete result table to:
-
-```text
-results/tables/poc_experiment.csv
-```
-
-The synthetic experiment works without downloading data. Internet access is required only when
-the OpenML loader in `data_preparation.py` is used.
-
-### Experiment 2: out-of-distribution uncertainty
-
-Experiment 2 runs the same seven model configurations as Experiment 1 over 20 seeds in two OOD
-settings. The synthetic setting trains on 300 noisy samples from
-`y = sin(1.5x) + epsilon` with inputs in `[-3, 3]` and evaluates 1,000 evenly spaced test inputs
-over `[-5, 5]`. All hidden layers in its Deep Ensemble, MC Dropout, and DKL configurations use
-four units. The real-data setting partitions the Combined Cycle Power Plant observations by
-PC1, using the middle 80% as ID data and both 10% tails as OOD data. Each seed uses 400 ID fitting
-observations and 80 separate ID validation observations.
-
-```bash
-python -u experiments/experiment_2.py
-```
-
-RMSE, NLL, CRPS, 90% coverage, and mean predicted uncertainty (the mean predictive standard
-deviation) are reported separately for ID and OOD observations. The command writes per-seed results
-to `results/tables/experiment_2.csv`, aggregate mean and standard deviation results to
-`results/tables/experiment_2_summary.csv`, and one synthetic prediction figure per model to
-`results/figures/experiment_2/`.
-
-### Concrete Compressive Strength experiment
-
-The real-data experiment uses the verified OpenML copy (data ID 44959) of the UCI Concrete
-Compressive Strength dataset:
-
-```bash
-python -u experiments/concrete_experiment.py
-```
-
-It evaluates training sizes 50, 100, 200, 400, and 800 over 10 reproducible splits,
-for a total of 310 eligible model runs. Because the dataset contains 1,030 rows, each split uses exactly
-1,000 rows as the nested training pool and 30 held-out rows for testing. Results are written to
-`results/tables/concrete_experiment.csv`. The dataset is downloaded once and cached under
-`.cache/scikit_learn/`.
-
-### Main experiment
-
-The main experiment compares UCI Combined Cycle Power Plant (ID 294) and Protein Tertiary
-Structure (ID 265) using separate reproducible 80/20 train/test splits:
-
-```bash
-python -u experiments/power_plant_experiment.py
-```
-
-It evaluates training sizes 50, 100, 200, 400, 800, and 1,600 over 20 splits per dataset.
-Only sparse-GP configurations with fewer inducing points than training observations are run.
-This produces 1,520 eligible runs in one result file:
-`results/tables/power_plant_experiment.csv`.
-
-### Power Plant and Electrical Grid Stability experiment
-
-A separate experiment replaces Protein Structure with UCI Electrical Grid Stability (ID 471)
-while retaining Power Plant, the same training sizes and models, and the sparse-GP eligibility
-rule:
+Run Experiment 1:
 
 ```bash
 python -u experiments/experiment_1.py
 ```
 
-Electrical Grid Stability uses the continuous `stab` target and drops the documented
-non-predictive `p1` field, leaving 11 numerical inputs. This run writes to
-`results/tables/experiment_1.csv`; it does not overwrite the existing
-Power Plant/Protein results in `results/tables/power_plant_experiment.csv`.
+Run Experiment 2:
 
-This experiment uses five splits. Deep Ensemble and MC Dropout use learning rate `0.001`;
-Exact GP, Sparse GP, and DKL use `0.01`.
-
-#### Dataset choice
-
-The two datasets create a controlled contrast between a four-feature engineering problem and a
-nine-feature biological problem. Power Plant provides a low-dimensional setting in which exact
-GPs should be strong, while Protein Structure tests whether sparse GPs and learned neural features
-become more useful as dimensionality and functional complexity increase. Both have numerical
-inputs, continuous targets, no missing values, and enough observations for an identical protocol.
-
-## Experimental approach
-
-### Shared evaluation protocol
-
-Every model is evaluated using the same data split, training subset, test observations, and
-metrics. This isolates differences between models as far as the current scaffold permits.
-
-The benchmark follows this sequence:
-
-1. Load or generate a regression dataset.
-2. Divide it into a training pool and a held-out test set.
-3. Generate one reproducibly shuffled training-pool ordering per split.
-4. Form nested fitting sets containing exactly each requested `train_size`.
-5. Add a separate nested validation set containing `ceil(0.2 * train_size)` observations.
-6. Fit feature standardization only on the model-fit partition and transform validation/test data.
-7. Train once, retaining the best checkpoint according to validation NLL and a minimum improvement
-   of `1e-4`.
-   Every method uses the same 50-epoch warm-up, patience 5, and 400-epoch ceiling for
-   validation-based early stopping.
-8. Evaluate that retained checkpoint directly; no second training run is performed.
-9. Predict a mean and variance for every test observation.
-10. Calculate accuracy and uncertainty metrics and store one row per model, split, and size.
-
-The default sweep uses:
-
-| Setting | Current value |
-| --- | --- |
-| Dataset | Synthetic nonlinear one-dimensional regression |
-| Total observations per split | 300 |
-| Training/test pool | 240/60 observations |
-| Training subset sizes | 25, 50, 100, 150 |
-| Additional validation size | 20% of the fitting size, rounded up |
-| Repeated seeds | 3 |
-| Model families/configurations | 5/7 |
-| Result rows | 84 |
-
-For each seed, the synthetic inputs are sampled uniformly from `[-3, 3]` and targets follow:
-
-```text
-y = sin(x) + 0.3x + ε,    ε ~ Normal(0, 0.2²)
+```bash
+python -u experiments/experiment_2.py
 ```
 
-Different seeds generate different synthetic datasets rather than alternative partitions of one
-fixed dataset.
+Both experiments are full repeated sweeps and can take a long time. Progress, elapsed time, and
+an estimated time remaining are printed while they run. The UCI datasets are downloaded on first
+use and then cached under `.cache/uci/`, so the first run requires internet access.
 
-### Models being compared
+### Outputs and analysis
 
-All models implement the same prediction contract:
+- Experiment 1 saves its per-seed table to `results/tables/experiment_1.csv`.
+- Experiment 2 saves per-seed ID/OOD results to `results/tables/experiment_2.csv` and
+  synthetic prediction plots to `results/figures/experiment_2/`.
+- The main analyses are in `notebooks/analysis_experiment_1.ipynb` and
+  `notebooks/analysis_experiment_2.ipynb`.
+
+
+## Experiment design
+
+### Shared protocol
+
+Both experiments use the common `execute_experiment()` interface implemented in
+`execute_experiment.py`. It provides the shared orchestration, training, and evaluation workflow.
+Shared protocol parameters and model factories are defined in `experiments/common.py`.
+
+When a validation size is configured, validation-based early stopping is used. After a 50-epoch
+warm-up, the checkpoint with the best validation NLL is retained, and training stops after five
+consecutive epochs without an improvement of at least `1e-4`. The retained model is evaluated directly without
+refitting.
+
+Each model run is timed. Training time covers construction and fitting through selection of the
+retained checkpoint. After fitting, inference time is measured as the median of 20 prediction
+calls following three untimed warm-up calls. 
+
+The interface also accepts an optional `fitted_model_callback`, which is called with each fitted
+model and its training data. Experiment 2 registers this callback for the one-dimensional
+synthetic dataset to collect predictions across runs; after the sweep, those predictions are used
+to create the model comparison figures. 
+
+Sparse-GP configurations are skipped unless the fitting
+set is strictly larger than the number of inducing points.
+
+### Experiment 1: small-data learning curves
+
+Experiment 1 measures how predictive accuracy and uncertainty change as the fitting set grows on
+two UCI regression datasets:
+
+| Dataset | UCI ID | Inputs | Split |
+| --- | ---: | ---: | --- |
+| Combined Cycle Power Plant | 294 | 4 | 7,654 train-pool / 1,914 test |
+| Electrical Grid Stability | 471 | 11 | 8,000 train-pool / 2,000 test |
+
+For Electrical Grid Stability, the continuous `stab` variable is the target and the documented
+non-predictive `p1` column is removed. Each dataset is randomly divided 80/20 for each of 20
+seeds. Models are fitted on nested subsets of 50, 100, 200, 400, 800, and 1,600 observations.
+The sweep produces 1,520 eligible model fits
+after applying the sparse-GP eligibility rule.
+
+The result table contains one row per dataset, seed, fitting-set size, and eligible model
+configuration. It records the selected epoch, inducing-point count where applicable, training and
+inference time, RMSE, NLL, CRPS, and 90% interval coverage.
+
+### Experiment 2: ID versus OOD uncertainty
+
+Experiment 2 asks whether predictive uncertainty increases appropriately away from the training
+distribution. It repeats every configuration over 20 seeds in two settings:
+
+- **Synthetic OOD:** 300 noisy fitting observations are sampled uniformly from `[-3, 3]`, with
+  60 additional validation observations. Evaluation uses 1,000 evenly spaced inputs on `[-5, 5]`;
+  `[-3, 3]` is labeled ID and the two outer intervals are labeled OOD. The latent function is the
+  smooth multi-bump function defined in `experiments/experiment_2.py`, with Gaussian noise of
+  standard deviation `0.2`.
+- **Power Plant OOD:** standardized input features are projected onto their first principal
+  component. The middle 80% of observations along PC1 form the ID pool and the lower and upper
+  10% tails form the OOD region. Each seed uses 400 ID fitting observations and 80 additional ID
+  validation observations. The test set contains all remaining ID observations and all OOD
+  observations.
+
+Metrics are reported separately for ID and OOD observations. Experiment 2 also records mean
+predictive standard deviation and creates one aggregate synthetic prediction plot per model. In
+the one-dimensional synthetic setting, the deep ensemble, MC-dropout, and DKL feature networks
+use two hidden layers of width 10. The complete experiment contains 280 model fits.
+
+## Models
+
+Every model exposes the same NumPy-facing prediction interface:
 
 ```python
 mean, variance = model.predict(X_test)
 ```
 
-| Model | Motivation | Current implementation |
+| Model | Implementation | File |
 | --- | --- | --- |
-| Exact GP | Principled small-data probabilistic baseline | BoTorch `SingleTaskGP` with Matérn-5/2 ARD kernel and learned observation noise |
-| Sparse GP | Test whether inducing-point approximations retain GP quality at lower cost | BoTorch `SingleTaskVariationalGP` with learned inducing locations, ELBO training, and `m ∈ {16, 64, 256}` |
-| Deep ensemble | Strong practical neural uncertainty baseline based on disagreement between independently trained networks | Five independently trained heteroscedastic Gaussian MLPs |
-| MC dropout | Inexpensive approximate Bayesian neural baseline using stochastic inference passes | Heteroscedastic MLP with dropout active over repeated inference passes |
-| DKL | Combine learned neural representations with a probabilistic GP head | Jointly trained neural feature extractor and exact Matérn-5/2 GP head |
+| Exact GP | BoTorch `SingleTaskGP` with a constant mean, Matérn-5/2 ARD kernel, learned output scale, and learned Gaussian observation noise. Parameters are optimized with the exact marginal log likelihood. | `models/exact_gp.py` |
+| Sparse GP (`m=16,64,256`) | BoTorch `SingleTaskVariationalGP` with learned inducing locations, the same Matérn-5/2 ARD covariance, and variational ELBO training. | `models/sparse_gp.py` |
+| Deep ensemble | Five independently initialized, heteroscedastic Gaussian MLPs. Their Gaussian components are combined by moment matching, capturing member disagreement and predicted observation noise. | `models/deep_ensemble.py` |
+| MC dropout | One heteroscedastic Gaussian MLP with dropout probability `0.1`; five stochastic forward passes are combined by moment matching at prediction time. | `models/mc_dropout.py` |
+| Deep kernel learning (DKL) | A jointly optimized two-hidden-layer neural feature extractor followed by an exact Matérn-5/2 GP. The learned feature space preserves the original input dimension. | `models/dkl.py` |
 
-All methods use float64. Neural models have two equal-width hidden layers, and DKL preserves the
-input dimension in its learned feature space. All five model classes share a default learning
-rate of `0.01`; callers can still explicitly override it when running a separate tuning study.
 
-The exact GP and DKL use the full training covariance matrix, which is appropriate for the
-small-data focus but will become expensive as the dataset grows. The public NumPy-array interface
-keeps the benchmark independent of the internal PyTorch implementation.
 
-Sparse GPs are evaluated only when the requested training size is strictly larger than the
-configuration's inducing-point count. This avoids treating a full-size inducing set as a sparse
-approximation and prevents duplicate capped configurations at small training sizes.
 
-### Metrics
 
-The benchmark records four metrics:
+Shared model utilities are implemented in `models/_common.py`, including random seeding, target
+standardization, the heteroscedastic Gaussian MLP, Gaussian NLL, and the neural-network training
+and early-stopping loop. The Deep Ensemble, MC Dropout, and DKL constructors all accept an optional
+`hidden_size`; when it is omitted, the width is `max(2, 2 * input_dim)`. The shared model factories
+and hyperparameters are defined in `experiments/common.py`.
+All implementations use 64-bit floating-point values.
 
-| Metric | What it measures | Preferred value |
-| --- | --- | --- |
-| RMSE | Accuracy of the predictive mean | Lower |
-| Gaussian NLL | Probability assigned to the observed targets using the predicted mean and standard deviation | Lower |
-| Gaussian CRPS | Combined probabilistic calibration and sharpness | Lower |
-| 90% interval coverage | Fraction of targets inside `mean ± 1.64485 × std` | Close to 0.90 |
-
-RMSE alone cannot determine whether uncertainty estimates are useful. NLL penalizes both inaccurate
-means and inappropriate uncertainty, but can become very large for confident errors. CRPS provides
-a probabilistic score in the target's units and is generally less dominated by isolated,
-overconfident predictions. Coverage checks whether prediction intervals achieve their stated
-frequency, although coverage alone does not reward narrow intervals.
-
-The benchmark records wall-clock time for the early-stopped training run and test-set inference.
-
-### Result format
-
-The generated CSV contains these columns:
-
-| Column | Meaning |
-| --- | --- |
-| `dataset` | Dataset identifier |
-| `split` | Repetition/seed index |
-| `train_size` | Requested number of training observations |
-| `model` | Model identifier |
-| `selected_epoch` | Best validation epoch (member mean for ensembles) |
-| `n_inducing` | Inducing-point count used for eligible SVGP rows; missing otherwise |
-| `final_training_time_seconds` | Complete early-stopped training time for the evaluated checkpoint |
-| `inference_time_seconds` | Median predictive-distribution computation time over 20 calls after 3 warm-up calls; excludes metric calculation |
-| `rmse` | Root mean squared error |
-| `nll` | Mean Gaussian negative log-likelihood |
-| `crps` | Mean Gaussian CRPS |
-| `coverage_90` | Empirical coverage of the nominal 90% interval |
-
-The command-line script saves all individual rows but prints metric means grouped by model and
-training size. Timing uses a monotonic high-resolution wall clock. Inference timing uses three
-untimed warm-up predictions followed by 20 measured predictions and stores their median; metric
-calculation is excluded. The first warm-up prediction supplies the values used for evaluation, so
-the repeated benchmark does not change which stochastic MC-dropout prediction is scored. The
-reported training time covers the complete model fit, including validation checks. The
-proof-of-concept script also prints phase-level progress, elapsed time, and a rolling ETA after
-every completed model run.
-
-### Plotting
-
-The current plotting helpers display learning curves and mean 90% coverage:
-
-```python
-import pandas as pd
-
-from plots import plot_coverage_vs_nominal, plot_learning_curve
-
-results = pd.read_csv("results/tables/poc_experiment.csv")
-
-plot_learning_curve(results, metric="rmse", dataset="synthetic")
-plot_coverage_vs_nominal(results, dataset="synthetic")
-```
-
-Plots are shown interactively and are not automatically saved. Calibration curves, confidence
-bands across repetitions, and one-dimensional extrapolation visualizations remain future work.
-
-## Using the experiment runner with another model or dataset
-
-`execute_experiment` accepts dictionaries of model factories and a custom dataset loader:
-
-```python
-from execute_experiment import execute_experiment
-from models import ExactGPModel
-
-results = execute_experiment(
-    model_factories={
-        "exact_gp": lambda X_train, y_train, **kwargs: ExactGPModel(
-            X_train, y_train, **kwargs
-        ),
-    },
-    dataset_names=["my_dataset"],
-    train_sizes=[25, 50, 100],
-    n_splits=3,
-    dataset_loader=my_dataset_loader,
-)
-```
-
-A dataset loader must accept a dataset name and `random_seed`, then return:
-
-```python
-{
-    "X_train": ...,
-    "X_test": ...,
-    "y_train": ...,
-    "y_test": ...,
-}
-```
-
-Without a custom loader, the benchmark calls `prepare_dataset_for_benchmark`. That function loads
-a named OpenML dataset and creates an 80/20 train/test split. It deliberately returns raw features:
-the benchmark fits a new scaler on each model-fit partition, preventing preprocessing leakage from
-the validation data, test data, or larger training subsets. Model factories receive `X_val`,
-`y_val`, and `random_seed` keyword arguments, so custom factories should accept and forward
-`**kwargs`.
-
-Each model standardizes targets using only the fitting observations. `train_size` directly counts
-those fitting observations; the additional validation observations select the checkpoint but are
-never incorporated into parameter fitting.
-
-## Project structure
+## Repository structure
 
 ```text
 .
 ├── README.md
 ├── LICENSE
 ├── requirements.txt
-├── .gitignore
-├── data_preparation.py
-├── metrics.py
 ├── execute_experiment.py
-├── plots.py
+├── metrics.py
+├── experiments/
+│   ├── common.py
+│   ├── experiment_1.py
+│   └── experiment_2.py
 ├── models/
 │   ├── __init__.py
 │   ├── _common.py
@@ -311,63 +161,27 @@ never incorporated into parameter fitting.
 │   ├── deep_ensemble.py
 │   ├── mc_dropout.py
 │   └── dkl.py
-├── experiments/
-│   └── poc_experiment.py
-├── tests/
-│   └── test_methods.py
+├── notebooks/
+│   ├── analysis_experiment_1.ipynb
+│   └── analysis_experiment_2_new.ipynb
 └── results/
-    └── tables/
-        └── poc_experiment.csv
+    ├── tables/
+    └── figures/
 ```
 
-### Root files
-
-- **`README.md`** — explains the research motivation, experimental design, and usage.
-- **`LICENSE`** — contains the MIT license under which the project is distributed.
-- **`requirements.txt`** — lists runtime and development dependencies. NumPy, SciPy, pandas,
-  scikit-learn, Matplotlib, and seaborn support the benchmark and metrics; PyTorch, BoTorch, and
-  GPyTorch provide the trained neural and GP implementations; JupyterLab supports interactive
-  analysis.
-- **`.gitignore`** — excludes virtual environments, Python caches, editor state, build output,
-  and other generated local files from version control.
-- **`data_preparation.py`** — loads named regression datasets, creates reproducible splits,
-  constructs nested subsets, assigns stable validation roles, and standardizes input features.
-- **`metrics.py`** — implements RMSE, Gaussian NLL, Gaussian CRPS, and interval coverage.
-- **`execute_experiment.py`** — contains the shared experiment orchestration. It loads each dataset,
-  iterates over seeds and training sizes, constructs every model, evaluates predictions, and
-  returns a pandas DataFrame.
-- **`plots.py`** — provides Matplotlib helpers for metric learning curves and comparisons between
-  empirical and nominal interval coverage.
-
-### `models/`
-
-The model package defines the common set of uncertainty-aware regressors:
-
-- **`models/__init__.py`** — exposes all five model classes through the `models` package.
-- **`models/_common.py`** — contains target scaling, seeding, the shared Gaussian MLP, and its
-  early-stopping training loop.
-- **`models/exact_gp.py`** — wraps BoTorch's exact `SingleTaskGP` baseline.
-- **`models/sparse_gp.py`** — wraps BoTorch's variational `SingleTaskVariationalGP` baseline.
-- **`models/deep_ensemble.py`** — trains independent heteroscedastic Gaussian MLP members.
-- **`models/mc_dropout.py`** — trains the shared MLP architecture and samples with dropout active.
-- **`models/dkl.py`** — jointly trains a dimension-preserving neural feature map and exact GP.
-
-### `experiments/`
-
-- **`experiments/poc_experiment.py`** — executable experiment entry point. It generates
-  synthetic data, defines seven configurations across five model families, runs the
-  3-seed × 4-size sweep, saves the
-  detailed CSV, and prints averages by model and training size.
-
-### `results/`
-
-This folder holds generated experiment artifacts:
-
-- **`results/tables/`** — stores machine-readable result tables.
-- **`results/tables/poc_experiment.csv`** — output path for the default 84-row synthetic sweep.
-
-A dedicated plot-output folder is not currently used because the plotting functions display
-figures rather than saving them.
+- `experiments/common.py` defines shared dataset loading and caching, the validation ratio, number
+  of splits, model hyperparameters, and model factories used by both experiments.
+- `experiments/experiment_1.py` loads and validates the two UCI datasets, executes the
+  learning-curve sweep, and writes the Experiment 1 table.
+- `experiments/experiment_2.py` defines the synthetic function and both ID/OOD partitions, reuses
+  the model configurations, saves per-seed regional results, and creates synthetic figures.
+- `execute_experiment.py` implements the shared nested-subset creation, feature scaling, training,
+  timing, callback, and evaluation loop.
+- `metrics.py` implements RMSE, Gaussian NLL, Gaussian CRPS, and prediction-interval coverage.
+- `models/_common.py` contains reproducibility, target scaling, the shared Gaussian MLP, and neural
+  early stopping. The other files in `models/` implement the five model families.
+- `notebooks/` contains result analysis and visualization; `results/` contains generated CSV tables
+  and figures.
 
 ## License
 

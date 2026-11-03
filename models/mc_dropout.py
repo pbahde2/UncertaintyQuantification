@@ -19,6 +19,7 @@ from ._common import (
 class MCDropoutModel:
     def __init__(self, X_train: np.ndarray, y_train: np.ndarray, n_samples: int = 5,
                  dropout_probability: float = 0.1,
+                 hidden_size: int | None = None,
                  learning_rate: float = DEFAULT_LEARNING_RATE,
                  max_epochs: int = 400, batch_size: int = 32, patience: int = 5,
                  warmup_epochs: int = 50, min_delta: float = 1e-4,
@@ -26,6 +27,7 @@ class MCDropoutModel:
                  X_val: np.ndarray | None = None, y_val: np.ndarray | None = None,
                  **_: object):
         self.n_samples, self.dropout_probability = n_samples, dropout_probability
+        self.hidden_size = hidden_size
         self.learning_rate, self.max_epochs = learning_rate, max_epochs
         self.batch_size, self.patience = batch_size, patience
         self.warmup_epochs, self.min_delta = warmup_epochs, min_delta
@@ -40,7 +42,11 @@ class MCDropoutModel:
         y = self.target_scaler.transform(y_train)
         y_val_scaled = self.target_scaler.transform(y_val) if y_val is not None else None
         set_seed(self.random_seed)
-        self.model = GaussianMLP(X.shape[1], dropout=self.dropout_probability)
+        self.model = GaussianMLP(
+            X.shape[1],
+            hidden_size=self.hidden_size,
+            dropout=self.dropout_probability,
+        )
         self.best_epoch_ = train_gaussian_network(
             self.model, X, y, learning_rate=self.learning_rate, max_epochs=self.max_epochs,
             batch_size=self.batch_size, patience=self.patience,

@@ -2,7 +2,7 @@
 
 Each file under this package contains one model class or factory function. The shared
 interface is intentionally simple: train on (X_train, y_train), then return predictive
-mean and predictive standard deviation on a new set of inputs X_test.
+mean and predictive variance on a new set of inputs X_test.
 """
 
 from .exact_gp import ExactGPModel

@@ -18,19 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from data_preparation import VALIDATION_RATIO as SHARED_VALIDATION_RATIO
 from execute_experiment import count_experiment_jobs, execute_experiment
-from experiments.experiment_1 import (
-    DEEP_ENSEMBLE_MC_DROPOUT_LEARNING_RATE,
-    GP_DKL_LEARNING_RATE,
-    MODEL_MAX_EPOCHS,
+from experiments.common import (
+    N_SPLITS,
+    VALIDATION_RATIO,
     build_model_factories,
     load_power_plant_data,
-)
-from models.synthetic_dkl import FixedWidthDKLModel
-from models.synthetic_mlp import (
-    FixedWidthDeepEnsembleModel,
-    FixedWidthMCDropoutModel,
 )
 
 
@@ -44,7 +37,6 @@ TRAIN_SIZES_BY_DATASET = {
     SYNTHETIC_DATASET_NAME: SYNTHETIC_TRAIN_SIZE,
     POWER_PLANT_DATASET_NAME: POWER_PLANT_TRAIN_SIZE,
 }
-VALIDATION_RATIO = SHARED_VALIDATION_RATIO
 SYNTHETIC_VALIDATION_SIZE = int(np.ceil(VALIDATION_RATIO * SYNTHETIC_TRAIN_SIZE))
 POWER_PLANT_VALIDATION_SIZE = int(
     np.ceil(VALIDATION_RATIO * POWER_PLANT_TRAIN_SIZE)
@@ -54,35 +46,16 @@ SYNTHETIC_TEST_SIZE = 1_000
 TRAIN_BOUND = 3.0
 TEST_BOUND = 5.0
 NOISE_STD = 0.2
-N_SPLITS = 20
 SYNTHETIC_NN_HIDDEN_SIZE = 10
 
 RESULT_PATH = ROOT / "results" / "tables" / "experiment_2_new2.csv"
-SUMMARY_PATH = ROOT / "results" / "tables" / "experiment_2_summary_new2.csv"
 FIGURE_DIRECTORY = ROOT / "results" / "figures" / "experiment_2_new2"
 
-# Backwards-compatible constants for code that used the original synthetic-only module.
-DATASET_NAME = SYNTHETIC_DATASET_NAME
-TRAIN_SIZE = SYNTHETIC_TRAIN_SIZE
-VALIDATION_SIZE = SYNTHETIC_VALIDATION_SIZE
-TRAIN_POOL_SIZE = SYNTHETIC_TRAIN_SIZE + SYNTHETIC_VALIDATION_SIZE
-TEST_SIZE = SYNTHETIC_TEST_SIZE
 RANDOM_SEED = 0
 
 
 def latent_function(x: np.ndarray) -> np.ndarray:
     """Return the noise-free synthetic regression function."""
-    #return np.sin(1.5 * np.asarray(x, dtype=float))+ 0.15*np.asarray(x, dtype=float)
-    #return np.asarray(x, dtype=float) ** 3 + np.asarray(x, dtype=float)
-    #return (
-    #    0.15 * x
-    #    + 1.3 * np.exp(-(x + 2.4)**2 / 0.9)
-    #    - 1.2 * np.exp(-(x + 1.3)**2 / 0.9)
-    #    + 1.5 * np.exp(-x**2 / 0.9)
-    #    - 1.3 * np.exp(-(x - 1.3)**2 / 0.9)
-    #    + 1.2 * np.exp(-(x - 2.4)**2 / 0.9)
-    #)
-    #return (0.5*x**4 - 8*x**2 + 2.5*x) / 25
     return (
         0.12 * x
         + 1.2 * np.exp(-0.5 * ((x + 2.1) / 0.7)**2)
@@ -90,6 +63,7 @@ def latent_function(x: np.ndarray) -> np.ndarray:
         + 1.4 * np.exp(-0.5 * ((x - 0.7) / 0.65)**2)
         - 1.2 * np.exp(-0.5 * ((x - 2.1) / 0.7)**2)
     )
+
 
 def synthetic_ood_dataset(
     dataset_name: str = SYNTHETIC_DATASET_NAME,
@@ -120,7 +94,6 @@ def synthetic_ood_dataset(
         ),
     }
 
-# split based on PCA, with the middle 80% as ID and the outer 20% as OOD
 def power_plant_id_ood_indices(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return the fixed middle-80% ID and two-tailed 20% OOD partition."""
     X = np.asarray(X, dtype=float)
@@ -177,41 +150,12 @@ def experiment_2_dataset(
     raise ValueError(f"Unsupported dataset: {dataset_name!r}")
 
 
-def model_factories(dataset_name: str | None = None) -> dict[str, object]:
-    """Return Experiment 1's configurations with the 1D NN width set to four."""
-    factories = build_model_factories()
-    if dataset_name == SYNTHETIC_DATASET_NAME:
-        factories["deep_ensemble"] = (
-            lambda X_train, y_train, **kwargs: FixedWidthDeepEnsembleModel(
-                X_train,
-                y_train,
-                hidden_size=SYNTHETIC_NN_HIDDEN_SIZE,
-                n_members=5,
-                learning_rate=DEEP_ENSEMBLE_MC_DROPOUT_LEARNING_RATE,
-                max_epochs=MODEL_MAX_EPOCHS,
-                **kwargs,
-            )
-        )
-        factories["mc_dropout"] = (
-            lambda X_train, y_train, **kwargs: FixedWidthMCDropoutModel(
-                X_train,
-                y_train,
-                hidden_size=SYNTHETIC_NN_HIDDEN_SIZE,
-                n_samples=5,
-                learning_rate=DEEP_ENSEMBLE_MC_DROPOUT_LEARNING_RATE,
-                max_epochs=MODEL_MAX_EPOCHS,
-                **kwargs,
-            )
-        )
-        factories["dkl"] = lambda X_train, y_train, **kwargs: FixedWidthDKLModel(
-            X_train,
-            y_train,
-            hidden_size=SYNTHETIC_NN_HIDDEN_SIZE,
-            learning_rate=GP_DKL_LEARNING_RATE,
-            max_epochs=MODEL_MAX_EPOCHS,
-            **kwargs,
-        )
-    return factories
+def _model_factories_for(dataset_name: str) -> dict[str, object]:
+    """Use a fixed neural width only for the one-dimensional synthetic dataset."""
+    hidden_size = (
+        SYNTHETIC_NN_HIDDEN_SIZE if dataset_name == SYNTHETIC_DATASET_NAME else None
+    )
+    return build_model_factories(hidden_size=hidden_size)
 
 
 class PredictionCollector:
@@ -306,38 +250,20 @@ class PredictionCollector:
         return output_paths
 
 
-def aggregate_results(result_df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate predictive metrics over the twenty random seeds."""
-    metric_columns = [
-        "rmse", "nll", "crps", "coverage_90", "mean_predictive_std"
-    ]
-    summary = (
-        result_df.groupby(["dataset", "model", "evaluation_region"], as_index=False)[
-            metric_columns
-        ]
-        .agg(["mean", "std"])
-        .reset_index()
-    )
-    summary.columns = [
-        "_".join(str(part) for part in column if part)
-        if isinstance(column, tuple)
-        else column
-        for column in summary.columns
-    ]
-    return summary
-
-
 def _run_dataset(
     dataset_name: str, prediction_collector: PredictionCollector
 ) -> pd.DataFrame:
     """Run one dataset with its prescribed fitting-set size."""
+
+    # Only collect synthetic predictions for one aggregate figure per model.
     callback = prediction_collector if dataset_name == SYNTHETIC_DATASET_NAME else None
     return execute_experiment(
-        model_factories=model_factories(dataset_name),
+        model_factories=_model_factories_for(dataset_name),
         dataset_names=[dataset_name],
         train_sizes=[TRAIN_SIZES_BY_DATASET[dataset_name]],
         n_splits=N_SPLITS,
         dataset_loader=experiment_2_dataset,
+        validation_ratio=VALIDATION_RATIO,
         test_region_key="test_region",
         fitted_model_callback=callback,
         verbose=True,
@@ -345,10 +271,10 @@ def _run_dataset(
 
 
 def run_experiment_2() -> pd.DataFrame:
-    """Run both OOD settings and save raw, aggregate, and figure outputs."""
+    """Run both OOD settings and save per-seed results and figure outputs."""
     total_jobs = sum(
         count_experiment_jobs(
-            model_factories(name),
+            _model_factories_for(name),
             [TRAIN_SIZES_BY_DATASET[name]],
             n_splits=N_SPLITS,
         )
@@ -362,26 +288,19 @@ def run_experiment_2() -> pd.DataFrame:
         flush=True,
     )
 
+    # Collect synthetic predictions for one aggregate figure per model.
     prediction_collector = PredictionCollector()
     result_df = pd.concat(
         [_run_dataset(name, prediction_collector) for name in DATASET_NAMES],
         ignore_index=True,
     )
-    summary_df = aggregate_results(result_df)
     figure_paths = prediction_collector.save_figures()
 
     RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
     result_df.to_csv(RESULT_PATH, index=False)
-    summary_df.to_csv(SUMMARY_PATH, index=False)
-    print(summary_df.to_string(index=False))
     print(f"\nSaved per-seed results to: {RESULT_PATH}")
-    print(f"Saved aggregated results to: {SUMMARY_PATH}")
     print(f"Saved {len(figure_paths)} synthetic figures to: {FIGURE_DIRECTORY}")
     return result_df
-
-
-# Retain the old callable name for callers while making experiment_2 the entry point.
-synthetic_ood_experiment = run_experiment_2
 
 
 if __name__ == "__main__":

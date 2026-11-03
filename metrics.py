@@ -8,8 +8,7 @@ include RMSE, NLL, CRPS, and coverage metrics.
 from __future__ import annotations
 
 import numpy as np
-from scipy.optimize import brentq
-from scipy.special import erf, logsumexp, ndtr, ndtri
+from scipy.special import erf, ndtri
 
 
 def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:

@@ -1,40 +1,33 @@
-"""Experiment execution runner for comparing uncertainty-aware regression methods.
-
-This module is the central orchestration point for the project. It loads data, creates
-subsets of different sizes, trains multiple models, evaluates them under the same metrics,
-then returns the resulting experiment table.
-
-The idea is to keep the research protocol consistent across all methods: same datasets,
-standardized features, matched train/test splits, and identical statistical reporting.
-"""
+"""Shared orchestration for both uncertainty-quantification experiments."""
 
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
 
-from data_preparation import (
-    nested_fit_validation_subsets,
-    prepare_dataset_for_benchmark,
-    standardize_features,
-)
 from metrics import compute_regression_metrics
 
 
 DEFAULT_INFERENCE_WARMUP_RUNS = 3
 DEFAULT_INFERENCE_TIMING_REPEATS = 20
 
+ModelFactory = Callable[..., Any]
+DatasetLoader = Callable[..., dict[str, np.ndarray]]
+FittedModelCallback = Callable[..., None]
+
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """A model factory plus protocol metadata used before the model is trained."""
+    """A model factory with optional sparse-GP scheduling metadata."""
 
-    factory: Callable[..., Any]
-    n_inducing: Optional[int] = None
+    factory: ModelFactory
+    n_inducing: int | None = None
 
     def __post_init__(self) -> None:
         if self.n_inducing is not None and self.n_inducing <= 0:
@@ -42,45 +35,142 @@ class ModelSpec:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self.n_inducing is not None:
-            configured_count = kwargs.setdefault("n_inducing", self.n_inducing)
-            if configured_count != self.n_inducing:
-                raise ValueError(
-                    "Factory call n_inducing does not match the ModelSpec metadata"
-                )
+            kwargs["n_inducing"] = self.n_inducing
         return self.factory(*args, **kwargs)
 
     def supports_train_size(self, train_size: int) -> bool:
-        """Return whether this configuration belongs in the requested benchmark row."""
         return self.n_inducing is None or train_size > self.n_inducing
 
 
+def _supports_train_size(model_factory: ModelFactory, train_size: int) -> bool:
+    supports = getattr(model_factory, "supports_train_size", None)
+    return supports is None or bool(supports(train_size))
+
+
 def count_experiment_jobs(
-    model_factories: Dict[str, Callable[..., Any]],
+    model_factories: Mapping[str, ModelFactory],
     train_sizes: Iterable[int],
     n_datasets: int = 1,
     n_splits: int = 1,
 ) -> int:
-    """Count scheduled runs after applying model-specific protocol constraints."""
+    """Count eligible model fits in an experiment."""
     runs_per_split = sum(
-        _supports_train_size(model_factory, train_size)
+        _supports_train_size(factory, train_size)
         for train_size in train_sizes
-        for model_factory in model_factories.values()
+        for factory in model_factories.values()
     )
     return n_datasets * n_splits * runs_per_split
 
 
-def _supports_train_size(model_factory: Callable[..., Any], train_size: int) -> bool:
-    """Apply optional scheduling metadata while retaining plain-callable compatibility."""
-    supports_train_size = getattr(model_factory, "supports_train_size", None)
-    return supports_train_size is None or bool(supports_train_size(train_size))
+def _nested_fit_validation_subsets(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    train_sizes: Iterable[int],
+    random_seed: int,
+    validation_ratio: float,
+) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Create nested fitting sets and disjoint, nested validation sets."""
+    sizes = [int(size) for size in train_sizes]
+    if not sizes or any(size <= 0 for size in sizes):
+        raise ValueError("train_sizes must contain positive integers")
+    if not 0.0 < validation_ratio < 1.0:
+        raise ValueError("validation_ratio must be between zero and one")
+
+    X_train = np.asarray(X_train)
+    y_train = np.asarray(y_train)
+    if len(X_train) != len(y_train):
+        raise ValueError("X_train and y_train must have equal length")
+
+    validation_sizes = {
+        size: int(np.ceil(validation_ratio * size)) for size in sizes
+    }
+    max_fit_size = max(sizes)
+    max_validation_size = max(validation_sizes.values())
+    required_size = max_fit_size + max_validation_size
+    if required_size > len(X_train):
+        raise ValueError(
+            f"requested {max_fit_size} fitting and {max_validation_size} validation "
+            f"observations, but only {len(X_train)} are available"
+        )
+
+    order = np.random.default_rng(random_seed).permutation(len(X_train))
+    fit_indices = order[:max_fit_size]
+    validation_indices = order[max_fit_size:required_size]
+    return {
+        size: (
+            X_train[fit_indices[:size]],
+            X_train[validation_indices[:validation_sizes[size]]],
+            y_train[fit_indices[:size]],
+            y_train[validation_indices[:validation_sizes[size]]],
+        )
+        for size in sizes
+    }
+
+
+def _predict_and_time(
+    model: Any,
+    X_test: np.ndarray,
+    warmup_runs: int,
+    timing_repeats: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Return one scored prediction and a stable median inference time."""
+    if warmup_runs < 1 or timing_repeats < 1:
+        raise ValueError("inference warm-up runs and timing repeats must be positive")
+
+    mean, variance = model.predict(X_test)
+    for _ in range(warmup_runs - 1):
+        model.predict(X_test)
+
+    durations = []
+    for _ in range(timing_repeats):
+        start = time.perf_counter()
+        model.predict(X_test)
+        durations.append(time.perf_counter() - start)
+
+    std = np.sqrt(np.maximum(variance, 1e-12))
+    return np.asarray(mean), std, float(np.median(durations))
+
+
+def _evaluation_rows(
+    model: Any,
+    model_name: str,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    region_labels: np.ndarray | None,
+    warmup_runs: int,
+    timing_repeats: int,
+) -> list[dict[str, Any]]:
+    """Evaluate one prediction globally or separately for each ID/OOD region."""
+    mean, std, inference_time = _predict_and_time(
+        model, X_test, warmup_runs, timing_repeats
+    )
+    base = {
+        "model": model_name,
+        "inference_time_seconds": inference_time,
+    }
+    if region_labels is None:
+        return [{**base, **compute_regression_metrics(y_test, mean, std)}]
+
+    region_labels = np.asarray(region_labels)
+    if len(region_labels) != len(y_test):
+        raise ValueError("test region labels must match the test-set length")
+    rows = []
+    for region in np.unique(region_labels):
+        mask = region_labels == region
+        rows.append(
+            {
+                **base,
+                "evaluation_region": str(region),
+                "n_evaluation": int(mask.sum()),
+                "mean_predictive_std": float(std[mask].mean()),
+                **compute_regression_metrics(y_test[mask], mean[mask], std[mask]),
+            }
+        )
+    return rows
 
 
 def _format_duration(seconds: float) -> str:
-    """Format a duration compactly for progress and ETA messages."""
-    seconds = float(seconds)
-    if not np.isfinite(seconds):
-        return "n/a"
-    seconds = max(0.0, seconds)
+    seconds = max(0.0, float(seconds))
     if seconds < 60.0:
         return f"{seconds:.1f}s"
     minutes, remaining_seconds = divmod(int(round(seconds)), 60)
@@ -90,186 +180,30 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h {remaining_minutes:02d}m"
 
 
-def run_single_experiment(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-    model_factory: Callable[..., Any],
-    model_name: str,
-    **kwargs,
-) -> Dict[str, Any]:
-    """Train one model and compute its metrics on a single split.
-
-    Parameters
-    ----------
-    X_train : np.ndarray
-        Training features.
-    y_train : np.ndarray
-        Training targets.
-    X_test : np.ndarray
-        Test features.
-    y_test : np.ndarray
-        Test targets.
-    model_factory : Callable
-        Function that builds and trains the model.
-    model_name : str
-        Human-readable model label.
-    **kwargs
-        Optional arguments passed to the model factory.
-
-    Returns
-    -------
-    dict
-        Dictionary containing the model name, metadata, and metrics.
-    """
-    # create and train the model using the provided factory function
-    model = model_factory(X_train, y_train, **kwargs)
-    # evaluate the model on the test set and compute metrics
-    mean, variance = model.predict(X_test)
-    std = np.sqrt(np.maximum(variance, 1e-12))
-    metrics = compute_regression_metrics(y_test, mean, std)
-
-    return {
-        "model": model_name,
-        "rmse": metrics["rmse"],
-        "nll": metrics["nll"],
-        "crps": metrics["crps"],
-        "coverage_90": metrics["coverage_90"],
-    }
-
-
-def evaluate_trained_model(
-    model: Any,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-    model_name: str,
-    inference_warmup_runs: int = DEFAULT_INFERENCE_WARMUP_RUNS,
-    inference_timing_repeats: int = DEFAULT_INFERENCE_TIMING_REPEATS,
-) -> Dict[str, Any]:
-    """Evaluate a trained model and benchmark prediction using repeated timings.
-
-    The first prediction is retained for metric calculation and also serves as the first
-    untimed warm-up. Additional warm-ups stabilize lazy initialization and caches. The
-    reported inference time is the median of the subsequent prediction calls; metric
-    calculation is intentionally excluded.
-    """
-    if inference_warmup_runs < 1:
-        raise ValueError("inference_warmup_runs must be at least 1")
-    if inference_timing_repeats < 1:
-        raise ValueError("inference_timing_repeats must be at least 1")
-
-    # Preserve the first prediction for metrics so repeated timing does not change which
-    # stochastic MC-dropout draw is evaluated relative to the previous protocol.
-    mean, variance = model.predict(X_test)
-    for _ in range(inference_warmup_runs - 1):
-        model.predict(X_test)
-
-    inference_durations = np.empty(inference_timing_repeats, dtype=float)
-    for repeat_idx in range(inference_timing_repeats):
-        inference_start = time.perf_counter()
-        model.predict(X_test)
-        inference_durations[repeat_idx] = time.perf_counter() - inference_start
-    inference_time_seconds = float(np.median(inference_durations))
-
-    std = np.sqrt(np.maximum(variance, 1e-12))
-    metrics = compute_regression_metrics(y_test, mean, std)
-    return {
-        "model": model_name,
-        "inference_time_seconds": inference_time_seconds,
-        **metrics,
-    }
-
-# Used for experiment 2 - out of distribution evaluation by region. The region labels are not used for training, only for evaluation.
-def evaluate_trained_model_by_region(
-    model: Any,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-    region_labels: np.ndarray,
-    model_name: str,
-    inference_warmup_runs: int = DEFAULT_INFERENCE_WARMUP_RUNS,
-    inference_timing_repeats: int = DEFAULT_INFERENCE_TIMING_REPEATS,
-) -> List[Dict[str, Any]]:
-    """Evaluate one prediction over a shared test set separately by region.
-
-    The complete test set is predicted together so regional scores are based on the same
-    predictive draw, including for stochastic methods such as MC dropout. Region labels only
-    partition predictions for metric calculation; they are never exposed during training.
-    """
-    if inference_warmup_runs < 1:
-        raise ValueError("inference_warmup_runs must be at least 1")
-    if inference_timing_repeats < 1:
-        raise ValueError("inference_timing_repeats must be at least 1")
-
-    X_test = np.asarray(X_test)
-    y_test = np.asarray(y_test)
-    region_labels = np.asarray(region_labels)
-    if len(X_test) != len(y_test) or len(X_test) != len(region_labels):
-        raise ValueError("X_test, y_test, and region_labels must have equal length")
-    if not len(X_test):
-        raise ValueError("the regional test set must not be empty")
-
-    mean, variance = model.predict(X_test)
-    for _ in range(inference_warmup_runs - 1):
-        model.predict(X_test)
-
-    inference_durations = np.empty(inference_timing_repeats, dtype=float)
-    for repeat_idx in range(inference_timing_repeats):
-        inference_start = time.perf_counter()
-        model.predict(X_test)
-        inference_durations[repeat_idx] = time.perf_counter() - inference_start
-    inference_time_seconds = float(np.median(inference_durations))
-
-    std = np.sqrt(np.maximum(variance, 1e-12))
-    rows: List[Dict[str, Any]] = []
-    # np.unique gives a stable ordering independent of the order in which test points occur.
-    for region in np.unique(region_labels):
-        mask = region_labels == region
-        if not np.any(mask):
-            continue
-        rows.append(
-            {
-                "model": model_name,
-                "evaluation_region": str(region),
-                "n_evaluation": int(np.sum(mask)),
-                "mean_predictive_std": float(np.mean(std[mask])),
-                "inference_time_seconds": inference_time_seconds,
-                **compute_regression_metrics(y_test[mask], mean[mask], std[mask]),
-            }
-        )
-    return rows
-
-
 def execute_experiment(
-    model_factories: Dict[str, Callable[..., Any]],
+    *,
+    model_factories: Mapping[str, ModelFactory],
     dataset_names: Iterable[str],
     train_sizes: Iterable[int],
+    dataset_loader: DatasetLoader,
+    validation_ratio: float,
     n_splits: int = 20,
-    dataset_loader: Optional[Callable[[str], Dict[str, np.ndarray]]] = None,
+    test_region_key: str | None = None,
+    fitted_model_callback: FittedModelCallback | None = None,
     verbose: bool = False,
     inference_warmup_runs: int = DEFAULT_INFERENCE_WARMUP_RUNS,
     inference_timing_repeats: int = DEFAULT_INFERENCE_TIMING_REPEATS,
-    test_region_key: Optional[str] = None,
-    fitted_model_callback: Optional[Callable[..., None]] = None,
 ) -> pd.DataFrame:
-    """Run the experiment across datasets, training sizes, and model families.
-
-    This is the main experimental loop. It performs the repeated train/test protocol and
-    builds a tabular result set that can later be exported to CSV or plotted as learning
-    curves. Each requested size is the exact number of fitting observations. An additional,
-    disjoint validation set is supplied for early stopping, and the retained best checkpoint is
-    evaluated directly. Feature scaling is fitted only on the fitting observations. A custom
-    ``dataset_loader`` can be supplied for synthetic or custom datasets.
-    """
-    rows: List[dict] = []
-    loader = dataset_loader or prepare_dataset_for_benchmark
+    """Train and evaluate every eligible model under the shared protocol."""
     dataset_names = list(dataset_names)
     train_sizes = list(train_sizes)
     total_jobs = count_experiment_jobs(
-        model_factories, train_sizes, n_datasets=len(dataset_names), n_splits=n_splits
+        model_factories, train_sizes, len(dataset_names), n_splits
     )
+    rows: list[dict[str, Any]] = []
     completed_jobs = 0
     experiment_start = time.perf_counter()
+
     if verbose:
         print(
             f"Starting {total_jobs} model runs...\n"
@@ -278,53 +212,46 @@ def execute_experiment(
             flush=True,
         )
 
-    # For every dataset
+    # per dataset,
     for dataset_name in dataset_names:
-        #For every split of the dataset
+        #per split,
         for split_idx in range(n_splits):
-            data = loader(dataset_name, random_seed=split_idx)
-            X_train, X_test, y_train, y_test = (
-                data["X_train"],
-                data["X_test"],
-                data["y_train"],
-                data["y_test"],
+            data = dataset_loader(dataset_name, random_seed=split_idx)
+            X_train = np.asarray(data["X_train"])
+            X_test = np.asarray(data["X_test"])
+            y_train = np.asarray(data["y_train"])
+            y_test = np.asarray(data["y_test"])
+            region_labels = (
+                np.asarray(data[test_region_key])
+                if test_region_key is not None
+                else None
             )
-            #Used for experiment 2 - out of distribution evaluation by region. The region labels are not used for training, only for evaluation.
-            region_labels = None
-            if test_region_key is not None:
-                if test_region_key not in data:
-                    raise KeyError(
-                        f"dataset loader did not return requested region key "
-                        f"{test_region_key!r}"
-                    )
-                region_labels = np.asarray(data[test_region_key])
-                if len(region_labels) != len(X_test):
-                    raise ValueError("test region labels must match the test-set length")
-            subsets = nested_fit_validation_subsets(
-                X_train,
-                y_train,
-                train_sizes,
-                random_seed=split_idx,
+            # split entire training set into nested fitting and validation sets for each requested train size
+            subsets = _nested_fit_validation_subsets(
+                X_train, y_train, train_sizes, split_idx, validation_ratio
             )
-            # For every training size, train the model and evaluate on the test set
+            #per train size
             for train_size, (X_fit, X_val, y_fit, y_val) in subsets.items():
-                # Scale without exposing validation observations or test observations.
-                X_fit_scaled, X_test_scaled, scaler = standardize_features(X_fit, X_test)
-                X_val_scaled = scaler.transform(X_val) if len(X_val) else X_val.copy()
+                # scale features based on the fitting set and apply the same transformation to validation and test sets
+                scaler = StandardScaler().fit(X_fit)
+                X_fit_scaled = scaler.transform(X_fit)
+                X_val_scaled = scaler.transform(X_val)
+                X_test_scaled = scaler.transform(X_test)
 
+                # per model
                 for model_name, model_factory in model_factories.items():
-                    # An SVGP is only a sparse approximation when the training set is
-                    # strictly larger than its requested inducing-point set.
                     if not _supports_train_size(model_factory, train_size):
                         continue
-                    job_number = completed_jobs + 1
                     if verbose:
                         print(
-                            f"[{job_number}/{total_jobs}] {dataset_name} | split={split_idx} | "
-                            f"train_size={train_size} | {model_name}: training with early stopping...",
+                            f"[{completed_jobs + 1}/{total_jobs}] {dataset_name} | "
+                            f"split={split_idx} | train_size={train_size} | "
+                            f"{model_name}: training...",
                             flush=True,
                         )
+                    # timing the training process
                     training_start = time.perf_counter()
+                    # train model
                     model = model_factory(
                         X_fit_scaled,
                         y_fit,
@@ -332,41 +259,25 @@ def execute_experiment(
                         y_val=y_val,
                         random_seed=split_idx,
                     )
-                    training_time_seconds = time.perf_counter() - training_start
+                    #stop training timer
+                    training_time = time.perf_counter() - training_start
                     member_epochs = getattr(model, "selected_epochs_", None)
-                    if member_epochs is not None:
-                        selected_epoch = float(np.mean(member_epochs))
-                    else:
-                        selected_epoch = float(getattr(model, "best_epoch_", np.nan))
-                    if verbose:
-                        print(
-                            f"    selected_epoch={selected_epoch:g} after "
-                            f"{_format_duration(training_time_seconds)}",
-                            flush=True,
-                        )
-                    # For SVGP rows, record the inducing count used by the fitted model.
-                    effective_inducing = float(getattr(model, "n_inducing_", np.nan))
-                    if region_labels is None:
-                        results = [
-                            evaluate_trained_model(
-                                model,
-                                X_test_scaled,
-                                y_test,
-                                model_name,
-                                inference_warmup_runs=inference_warmup_runs,
-                                inference_timing_repeats=inference_timing_repeats,
-                            )
-                        ]
-                    else:
-                        results = evaluate_trained_model_by_region(
-                            model,
-                            X_test_scaled,
-                            y_test,
-                            region_labels,
-                            model_name,
-                            inference_warmup_runs=inference_warmup_runs,
-                            inference_timing_repeats=inference_timing_repeats,
-                        )
+                    selected_epoch = float(
+                        np.mean(member_epochs)
+                        if member_epochs is not None
+                        else getattr(model, "best_epoch_", np.nan)
+                    )
+
+                    #evaluate the model on the test set and compute metrics
+                    results = _evaluation_rows(
+                        model,
+                        model_name,
+                        X_test_scaled,
+                        y_test,
+                        region_labels,
+                        inference_warmup_runs,
+                        inference_timing_repeats,
+                    )
                     for result in results:
                         rows.append(
                             {
@@ -374,11 +285,14 @@ def execute_experiment(
                                 "split": split_idx,
                                 "train_size": train_size,
                                 "selected_epoch": selected_epoch,
-                                "n_inducing": effective_inducing,
-                                "final_training_time_seconds": training_time_seconds,
+                                "n_inducing": float(
+                                    getattr(model, "n_inducing_", np.nan)
+                                ),
+                                "final_training_time_seconds": training_time,
                                 **result,
                             }
                         )
+                    # used to create the figures for the 1D test case
                     if fitted_model_callback is not None:
                         fitted_model_callback(
                             model=model,
@@ -390,30 +304,33 @@ def execute_experiment(
                             y_train=y_fit,
                             feature_scaler=scaler,
                         )
+
                     completed_jobs += 1
                     if verbose:
                         elapsed = time.perf_counter() - experiment_start
                         eta = elapsed / completed_jobs * (total_jobs - completed_jobs)
                         print(
-                            f"    done | train={_format_duration(training_time_seconds)} | "
-                            f"infer={_format_duration(result['inference_time_seconds'])} | "
-                            f"elapsed={_format_duration(elapsed)} | ETA≈{_format_duration(eta)}",
+                            f"    selected_epoch={selected_epoch:g} | "
+                            f"train={_format_duration(training_time)} | "
+                            f"infer={_format_duration(results[0]['inference_time_seconds'])} | "
+                            f"elapsed={_format_duration(elapsed)} | "
+                            f"ETA≈{_format_duration(eta)}",
                             flush=True,
                         )
 
     if verbose:
         elapsed = time.perf_counter() - experiment_start
-        print(f"Finished {completed_jobs} model runs in {_format_duration(elapsed)}.", flush=True)
+        print(
+            f"Finished {completed_jobs} model runs in {_format_duration(elapsed)}.",
+            flush=True,
+        )
     return pd.DataFrame(rows)
 
 
 __all__ = [
+    "DEFAULT_INFERENCE_TIMING_REPEATS",
+    "DEFAULT_INFERENCE_WARMUP_RUNS",
     "ModelSpec",
     "count_experiment_jobs",
-    "run_single_experiment",
-    "evaluate_trained_model",
-    "evaluate_trained_model_by_region",
     "execute_experiment",
-    "DEFAULT_INFERENCE_WARMUP_RUNS",
-    "DEFAULT_INFERENCE_TIMING_REPEATS",
 ]

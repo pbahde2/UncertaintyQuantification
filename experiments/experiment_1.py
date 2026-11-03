@@ -3,143 +3,33 @@
 from __future__ import annotations
 
 import sys
-from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
-import numpy as np
 from sklearn.model_selection import train_test_split
-from ucimlrepo import fetch_ucirepo
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from execute_experiment import ModelSpec, count_experiment_jobs, execute_experiment
-from models.deep_ensemble import DeepEnsembleModel
-from models.dkl import DKLModel
-from models.exact_gp import ExactGPModel
-from models.mc_dropout import MCDropoutModel
-from models.sparse_gp import SparseGPModel
+from execute_experiment import count_experiment_jobs, execute_experiment
+from experiments.common import (
+    DATASET_NAMES,
+    N_SPLITS,
+    UCI_DATA_IDS,
+    VALIDATION_RATIO,
+    build_model_factories,
+    load_dataset,
+)
 
-
-GRID_DATASET_NAME = "electrical_grid_stability"
-GRID_UCI_DATA_ID = 471
-GRID_TOTAL_OBSERVATIONS = 10_000
-# UCI supplies 12 candidate inputs. The documented non-predictive p1 column is removed.
-GRID_N_FEATURES = 11
-GRID_TRAIN_POOL_SIZE = 8_000
-GRID_TEST_SIZE = 2_000
-GRID_CACHE_PATH = ROOT / ".cache" / "uci" / "electrical_grid_stability_471.npz"
-
-POWER_PLANT_DATASET_NAME = "combined_cycle_power_plant"
-POWER_PLANT_UCI_DATA_ID = 294
-POWER_PLANT_TOTAL_OBSERVATIONS = 9_568
-POWER_PLANT_N_FEATURES = 4
-POWER_PLANT_TRAIN_POOL_SIZE = 7_654
-POWER_PLANT_TEST_SIZE = 1_914
-POWER_PLANT_CACHE_PATH = ROOT / ".cache" / "uci" / "power_plant_294.npz"
 
 TRAIN_FRACTION = 0.8
-DEEP_ENSEMBLE_MC_DROPOUT_LEARNING_RATE = 0.001
-GP_DKL_LEARNING_RATE = 0.01
-MODEL_MAX_EPOCHS = 400
 TRAIN_SIZES = [50, 100, 200, 400, 800, 1_600]
-N_SPLITS = 20
 OUTPUT_PATH = ROOT / "results" / "tables" / "experiment_1.csv"
-
-DATASET_SPECS = {
-    POWER_PLANT_DATASET_NAME: {
-        "uci_data_id": POWER_PLANT_UCI_DATA_ID,
-        "total_observations": POWER_PLANT_TOTAL_OBSERVATIONS,
-        "n_features": POWER_PLANT_N_FEATURES,
-        "train_pool_size": POWER_PLANT_TRAIN_POOL_SIZE,
-        "test_size": POWER_PLANT_TEST_SIZE,
-    },
-    GRID_DATASET_NAME: {
-        "uci_data_id": GRID_UCI_DATA_ID,
-        "total_observations": GRID_TOTAL_OBSERVATIONS,
-        "n_features": GRID_N_FEATURES,
-        "train_pool_size": GRID_TRAIN_POOL_SIZE,
-        "test_size": GRID_TEST_SIZE,
-    },
-}
-
-
-@lru_cache(maxsize=1)
-def load_power_plant_data() -> tuple[np.ndarray, np.ndarray]:
-    """Load, validate, and cache UCI dataset 294 for regression."""
-    if POWER_PLANT_CACHE_PATH.exists():
-        with np.load(POWER_PLANT_CACHE_PATH) as cached:
-            X = cached["X"]
-            y = cached["y"]
-    else:
-        dataset = fetch_ucirepo(id=POWER_PLANT_UCI_DATA_ID)
-        X = dataset.data.features.to_numpy(dtype=float)
-        y = dataset.data.targets.to_numpy(dtype=float).reshape(-1)
-
-    expected_X_shape = (POWER_PLANT_TOTAL_OBSERVATIONS, POWER_PLANT_N_FEATURES)
-    expected_y_shape = (POWER_PLANT_TOTAL_OBSERVATIONS,)
-    if X.shape != expected_X_shape or y.shape != expected_y_shape:
-        raise ValueError(
-            "Unexpected Combined Cycle Power Plant shape: "
-            f"X={X.shape}, y={y.shape}; expected {expected_X_shape} and "
-            f"{expected_y_shape}."
-        )
-    if not np.isfinite(X).all() or not np.isfinite(y).all():
-        raise ValueError("Combined Cycle Power Plant data contains non-finite values")
-
-    if not POWER_PLANT_CACHE_PATH.exists():
-        POWER_PLANT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(POWER_PLANT_CACHE_PATH, X=X, y=y)
-    return X, y
-
-
-def _extract_electrical_grid_arrays(dataset: Any) -> tuple[np.ndarray, np.ndarray]:
-    """Select the continuous stability target and remove UCI's non-predictive p1 field."""
-    features = dataset.data.features.drop(columns=["p1"], errors="raise")
-    if "stab" not in dataset.data.targets:
-        raise ValueError("UCI Electrical Grid data does not contain the 'stab' target")
-    X = features.to_numpy(dtype=float)
-    y = dataset.data.targets["stab"].to_numpy(dtype=float)
-    return X, y
-
-
-@lru_cache(maxsize=1)
-def load_electrical_grid_data() -> tuple[np.ndarray, np.ndarray]:
-    """Load, validate, and cache UCI dataset 471 for continuous regression."""
-    if GRID_CACHE_PATH.exists():
-        with np.load(GRID_CACHE_PATH) as cached:
-            X = cached["X"]
-            y = cached["y"]
-    else:
-        X, y = _extract_electrical_grid_arrays(fetch_ucirepo(id=GRID_UCI_DATA_ID))
-
-    expected_X_shape = (GRID_TOTAL_OBSERVATIONS, GRID_N_FEATURES)
-    expected_y_shape = (GRID_TOTAL_OBSERVATIONS,)
-    if X.shape != expected_X_shape or y.shape != expected_y_shape:
-        raise ValueError(
-            "Unexpected Electrical Grid Stability shape: "
-            f"X={X.shape}, y={y.shape}; expected {expected_X_shape} and "
-            f"{expected_y_shape}."
-        )
-    if not np.isfinite(X).all() or not np.isfinite(y).all():
-        raise ValueError("Electrical Grid Stability data contains non-finite values")
-
-    if not GRID_CACHE_PATH.exists():
-        GRID_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(GRID_CACHE_PATH, X=X, y=y)
-    return X, y
 
 
 def power_plant_grid_dataset(dataset_name: str, random_seed: int = 0):
     """Create one reproducible 80/20 partition for either benchmark dataset."""
-    if dataset_name == POWER_PLANT_DATASET_NAME:
-        X, y = load_power_plant_data()
-    elif dataset_name == GRID_DATASET_NAME:
-        X, y = load_electrical_grid_data()
-    else:
-        raise ValueError(f"Unsupported dataset: {dataset_name!r}")
+    X, y = load_dataset(dataset_name)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X,
@@ -156,75 +46,49 @@ def power_plant_grid_dataset(dataset_name: str, random_seed: int = 0):
         "y_test": y_test,
     }
 
-# function to build model factories for the experiment, the parameters for the models are set according to the experiment specifications
-def build_model_factories():
-    """Build the seven model configurations used by the shared protocol."""
-    def sparse_gp_factory(X_train, y_train, **kwargs):
-        return SparseGPModel(
-            X_train,
-            y_train,
-            learning_rate=GP_DKL_LEARNING_RATE,
-            max_epochs=MODEL_MAX_EPOCHS,
-            **kwargs,
-        )
 
-    return {
-        "exact_gp": lambda X_train, y_train, **kwargs: ExactGPModel(
-            X_train,
-            y_train,
-            learning_rate=GP_DKL_LEARNING_RATE,
-            max_epochs=MODEL_MAX_EPOCHS,
-            **kwargs,
-        ),
-        "sparse_gp_m16": ModelSpec(sparse_gp_factory, n_inducing=16),
-        "sparse_gp_m64": ModelSpec(sparse_gp_factory, n_inducing=64),
-        "sparse_gp_m256": ModelSpec(sparse_gp_factory, n_inducing=256),
-        "deep_ensemble": lambda X_train, y_train, **kwargs: DeepEnsembleModel(
-            X_train, y_train, n_members=5,
-            learning_rate=DEEP_ENSEMBLE_MC_DROPOUT_LEARNING_RATE,
-            max_epochs=MODEL_MAX_EPOCHS,
-            **kwargs,
-        ),
-        "mc_dropout": lambda X_train, y_train, **kwargs: MCDropoutModel(
-            X_train, y_train, n_samples=5,
-            learning_rate=DEEP_ENSEMBLE_MC_DROPOUT_LEARNING_RATE,
-            max_epochs=MODEL_MAX_EPOCHS,
-            **kwargs,
-        ),
-        "dkl": lambda X_train, y_train, **kwargs: DKLModel(
-            X_train,
-            y_train,
-            learning_rate=GP_DKL_LEARNING_RATE,
-            max_epochs=MODEL_MAX_EPOCHS,
-            **kwargs,
-        ),
-    }
+def dataset_metadata() -> dict[str, dict[str, int]]:
+    """Derive dataset dimensions and split sizes from the loaded data."""
+    metadata = {}
+    for dataset_name in DATASET_NAMES:
+        X, _ = load_dataset(dataset_name)
+        split = power_plant_grid_dataset(dataset_name, random_seed=0)
+        metadata[dataset_name] = {
+            "uci_data_id": UCI_DATA_IDS[dataset_name],
+            "total_observations": len(X),
+            "n_features": X.shape[1],
+            "train_pool_size": len(split["X_train"]),
+            "test_size": len(split["X_test"]),
+        }
+    return metadata
+
 
 def run_experiment_1() -> None:
     """Run Experiment 1 and write its dedicated result table."""
     model_factories = build_model_factories()
-    dataset_names = list(DATASET_SPECS)
+    metadata = dataset_metadata()
     dataset_lines = "\n".join(
         f"  {name}: {spec['total_observations']} rows, {spec['n_features']} features, "
         f"{spec['train_pool_size']} train-pool rows, {spec['test_size']} test rows"
-        for name, spec in DATASET_SPECS.items()
+        for name, spec in metadata.items()
     )
     print(
         f"Datasets:\n{dataset_lines}\n"
         f"Protocol: {N_SPLITS} splits per dataset\n"
         f"Training sizes: {TRAIN_SIZES}\n"
         f"Total model runs: "
-        f"{count_experiment_jobs(model_factories, TRAIN_SIZES, len(dataset_names), N_SPLITS)}\n"
+        f"{count_experiment_jobs(model_factories, TRAIN_SIZES, len(DATASET_NAMES), N_SPLITS)}\n"
         f"Output: {OUTPUT_PATH}",
         flush=True,
     )
 
     result_df = execute_experiment(
         model_factories=model_factories,
-        dataset_names=dataset_names,
+        dataset_names=DATASET_NAMES,
         train_sizes=TRAIN_SIZES,
         n_splits=N_SPLITS,
         dataset_loader=power_plant_grid_dataset,
+        validation_ratio=VALIDATION_RATIO,
         verbose=True,
     )
 
@@ -232,21 +96,21 @@ def run_experiment_1() -> None:
         3,
         "train_pool_size",
         result_df["dataset"].map(
-            {name: spec["train_pool_size"] for name, spec in DATASET_SPECS.items()}
+            {name: spec["train_pool_size"] for name, spec in metadata.items()}
         ),
     )
     result_df.insert(
         4,
         "test_size",
         result_df["dataset"].map(
-            {name: spec["test_size"] for name, spec in DATASET_SPECS.items()}
+            {name: spec["test_size"] for name, spec in metadata.items()}
         ),
     )
     result_df.insert(
         5,
         "uci_data_id",
         result_df["dataset"].map(
-            {name: spec["uci_data_id"] for name, spec in DATASET_SPECS.items()}
+            {name: spec["uci_data_id"] for name, spec in metadata.items()}
         ),
     )
 

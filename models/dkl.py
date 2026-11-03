@@ -14,14 +14,15 @@ from ._common import (
     TargetStandardizer,
     as_2d,
     gaussian_nll,
+    resolve_hidden_size,
     set_seed,
 )
 
 
 class _FeatureExtractor(nn.Module):
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, hidden_size: int | None = None):
         super().__init__()
-        width = max(2, 2 * input_dim)
+        width = resolve_hidden_size(input_dim, hidden_size)
         self.network = nn.Sequential(
             nn.Linear(input_dim, width, dtype=TORCH_DTYPE), nn.ReLU(),
             nn.Linear(width, width, dtype=TORCH_DTYPE), nn.ReLU(),
@@ -35,10 +36,11 @@ class _FeatureExtractor(nn.Module):
 
 class _DKLGP(gpytorch.models.ExactGP):
     def __init__(self, train_x: torch.Tensor, train_y: torch.Tensor,
-                 likelihood: gpytorch.likelihoods.GaussianLikelihood):
+                 likelihood: gpytorch.likelihoods.GaussianLikelihood,
+                 hidden_size: int | None = None):
         super().__init__(train_x, train_y, likelihood)
         feature_dim = train_x.shape[-1]
-        self.feature_extractor = _FeatureExtractor(feature_dim)
+        self.feature_extractor = _FeatureExtractor(feature_dim, hidden_size)
         self.mean_module = gpytorch.means.ConstantMean()
         self.covar_module = gpytorch.kernels.ScaleKernel(
             gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=feature_dim)
@@ -53,11 +55,13 @@ class _DKLGP(gpytorch.models.ExactGP):
 
 class DKLModel:
     def __init__(self, X_train: np.ndarray, y_train: np.ndarray,
+                 hidden_size: int | None = None,
                  learning_rate: float = DEFAULT_LEARNING_RATE, max_epochs: int = 400,
                  patience: int = 5, warmup_epochs: int = 50,
                  min_delta: float = 1e-4, random_seed: int = 0,
                  X_val: np.ndarray | None = None, y_val: np.ndarray | None = None,
                  **_: object):
+        self.hidden_size = hidden_size
         self.learning_rate, self.max_epochs = learning_rate, max_epochs
         self.patience, self.warmup_epochs = patience, warmup_epochs
         self.min_delta, self.random_seed = min_delta, random_seed
@@ -85,7 +89,9 @@ class DKLModel:
         )
         self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
         self.likelihood.noise = 0.1
-        self.model = _DKLGP(train_x, train_y, self.likelihood).to(dtype=TORCH_DTYPE)
+        self.model = _DKLGP(
+            train_x, train_y, self.likelihood, self.hidden_size
+        ).to(dtype=TORCH_DTYPE)
         self.model.train()
         self.likelihood.train()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)

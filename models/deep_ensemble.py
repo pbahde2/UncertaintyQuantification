@@ -20,6 +20,7 @@ class DeepEnsembleModel:
     """Five independently initialized MLP Gaussian regressors by default."""
 
     def __init__(self, X_train: np.ndarray, y_train: np.ndarray, n_members: int = 5,
+                 hidden_size: int | None = None,
                  learning_rate: float = DEFAULT_LEARNING_RATE, max_epochs: int = 400,
                  batch_size: int = 32, patience: int = 5, warmup_epochs: int = 50,
                  min_delta: float = 1e-4,
@@ -27,6 +28,7 @@ class DeepEnsembleModel:
                  X_val: np.ndarray | None = None, y_val: np.ndarray | None = None,
                  **_: object):
         self.n_members = n_members
+        self.hidden_size = hidden_size
         self.learning_rate, self.max_epochs = learning_rate, max_epochs
         self.batch_size, self.patience = batch_size, patience
         self.warmup_epochs, self.min_delta = warmup_epochs, min_delta
@@ -46,7 +48,7 @@ class DeepEnsembleModel:
         for member_idx in range(self.n_members):
             seed = self.random_seed + member_idx
             set_seed(seed)
-            member = GaussianMLP(X.shape[1])
+            member = GaussianMLP(X.shape[1], hidden_size=self.hidden_size)
             best_epoch = train_gaussian_network(
                 member, X, y, learning_rate=self.learning_rate, max_epochs=self.max_epochs,
                 batch_size=self.batch_size, patience=self.patience,

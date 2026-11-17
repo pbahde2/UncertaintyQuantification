@@ -62,47 +62,33 @@ def count_experiment_jobs(
     return n_datasets * n_splits * runs_per_split
 
 
-def _nested_fit_validation_subsets(
+def _nested_training_subsets(
     X_train: np.ndarray,
     y_train: np.ndarray,
     train_sizes: Iterable[int],
     random_seed: int,
-    validation_ratio: float,
-) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    """Create nested fitting sets and disjoint, nested validation sets."""
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """Create nested subsets representing each model's complete label budget."""
     sizes = [int(size) for size in train_sizes]
     if not sizes or any(size <= 0 for size in sizes):
         raise ValueError("train_sizes must contain positive integers")
-    if not 0.0 < validation_ratio < 1.0:
-        raise ValueError("validation_ratio must be between zero and one")
 
     X_train = np.asarray(X_train)
     y_train = np.asarray(y_train)
     if len(X_train) != len(y_train):
         raise ValueError("X_train and y_train must have equal length")
 
-    validation_sizes = {
-        size: int(np.ceil(validation_ratio * size)) for size in sizes
-    }
-    max_fit_size = max(sizes)
-    max_validation_size = max(validation_sizes.values())
-    required_size = max_fit_size + max_validation_size
-    if required_size > len(X_train):
+    max_train_size = max(sizes)
+    if max_train_size > len(X_train):
         raise ValueError(
-            f"requested {max_fit_size} fitting and {max_validation_size} validation "
-            f"observations, but only {len(X_train)} are available"
+            f"requested {max_train_size} training observations, but only "
+            f"{len(X_train)} are available"
         )
 
     order = np.random.default_rng(random_seed).permutation(len(X_train))
-    fit_indices = order[:max_fit_size]
-    validation_indices = order[max_fit_size:required_size]
+    training_indices = order[:max_train_size]
     return {
-        size: (
-            X_train[fit_indices[:size]],
-            X_train[validation_indices[:validation_sizes[size]]],
-            y_train[fit_indices[:size]],
-            y_train[validation_indices[:validation_sizes[size]]],
-        )
+        size: (X_train[training_indices[:size]], y_train[training_indices[:size]])
         for size in sizes
     }
 
@@ -186,7 +172,6 @@ def execute_experiment(
     dataset_names: Iterable[str],
     train_sizes: Iterable[int],
     dataset_loader: DatasetLoader,
-    validation_ratio: float,
     n_splits: int = 20,
     test_region_key: str | None = None,
     fitted_model_callback: FittedModelCallback | None = None,
@@ -226,16 +211,15 @@ def execute_experiment(
                 if test_region_key is not None
                 else None
             )
-            # split entire training set into nested fitting and validation sets for each requested train size
-            subsets = _nested_fit_validation_subsets(
-                X_train, y_train, train_sizes, split_idx, validation_ratio
+            # Draw nested subsets, each representing the complete label budget.
+            subsets = _nested_training_subsets(
+                X_train, y_train, train_sizes, split_idx
             )
             #per train size
-            for train_size, (X_fit, X_val, y_fit, y_val) in subsets.items():
-                # scale features based on the fitting set and apply the same transformation to validation and test sets
-                scaler = StandardScaler().fit(X_fit)
-                X_fit_scaled = scaler.transform(X_fit)
-                X_val_scaled = scaler.transform(X_val)
+            for train_size, (X_train_subset, y_train_subset) in subsets.items():
+                # Scale features from the complete training subset.
+                scaler = StandardScaler().fit(X_train_subset)
+                X_train_scaled = scaler.transform(X_train_subset)
                 X_test_scaled = scaler.transform(X_test)
 
                 # per model
@@ -253,10 +237,8 @@ def execute_experiment(
                     training_start = time.perf_counter()
                     # train model
                     model = model_factory(
-                        X_fit_scaled,
-                        y_fit,
-                        X_val=X_val_scaled,
-                        y_val=y_val,
+                        X_train_scaled,
+                        y_train_subset,
                         random_seed=split_idx,
                     )
                     #stop training timer
@@ -267,6 +249,13 @@ def execute_experiment(
                         if member_epochs is not None
                         else getattr(model, "best_epoch_", np.nan)
                     )
+                    optimization_steps = float(
+                        getattr(model, "optimization_steps_", np.nan)
+                    )
+                    optimization_epochs = float(
+                        getattr(model, "optimization_epochs_", np.nan)
+                    )
+                    optimization_status = getattr(model, "optimization_status_", None)
 
                     #evaluate the model on the test set and compute metrics
                     results = _evaluation_rows(
@@ -284,7 +273,12 @@ def execute_experiment(
                                 "dataset": dataset_name,
                                 "split": split_idx,
                                 "train_size": train_size,
+                                "objective_train_size": train_size,
+                                "validation_size": 0,
                                 "selected_epoch": selected_epoch,
+                                "optimization_epochs": optimization_epochs,
+                                "optimization_steps": optimization_steps,
+                                "optimization_status": optimization_status,
                                 "n_inducing": float(
                                     getattr(model, "n_inducing_", np.nan)
                                 ),
@@ -300,8 +294,8 @@ def execute_experiment(
                             dataset_name=dataset_name,
                             split_idx=split_idx,
                             train_size=train_size,
-                            X_train=X_fit,
-                            y_train=y_fit,
+                            X_train=X_train_subset,
+                            y_train=y_train_subset,
                             feature_scaler=scaler,
                         )
 
@@ -309,8 +303,18 @@ def execute_experiment(
                     if verbose:
                         elapsed = time.perf_counter() - experiment_start
                         eta = elapsed / completed_jobs * (total_jobs - completed_jobs)
+                        stopping_parts = []
+                        if np.isfinite(optimization_epochs):
+                            stopping_parts.append(f"epochs={optimization_epochs:g}")
+                        if np.isfinite(selected_epoch):
+                            stopping_parts.append(f"selected_epoch={selected_epoch:g}")
+                        if not stopping_parts:
+                            stopping_parts.append(
+                                f"optimization_status={optimization_status}"
+                            )
+                        stopping_detail = " | ".join(stopping_parts)
                         print(
-                            f"    selected_epoch={selected_epoch:g} | "
+                            f"    {stopping_detail} | "
                             f"train={_format_duration(training_time)} | "
                             f"infer={_format_duration(results[0]['inference_time_seconds'])} | "
                             f"elapsed={_format_duration(elapsed)} | "

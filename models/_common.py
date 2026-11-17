@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import random
 from dataclasses import dataclass
 
@@ -16,6 +15,54 @@ from torch import nn
 NUMPY_DTYPE = np.float64
 TORCH_DTYPE = torch.float64
 DEFAULT_LEARNING_RATE = 0.01
+
+
+class TrainingObjectiveStoppingCriterion:
+    """Patience stopping for a scalar full-training objective."""
+
+    def __init__(
+        self,
+        *,
+        first_monitored_step: int,
+        patience: int,
+        min_delta: float,
+    ) -> None:
+        if first_monitored_step <= 0 or patience <= 0 or min_delta < 0:
+            raise ValueError(
+                "first_monitored_step and patience must be positive and "
+                "min_delta must be non-negative"
+            )
+        self.first_monitored_step = first_monitored_step
+        self.patience = patience
+        self.min_delta = min_delta
+        self.reset()
+
+    def reset(self) -> None:
+        self.step = 0
+        self.best_loss = float("inf")
+        self.best_step = 0
+        self.stale_steps = 0
+        self.improved = False
+        self.converged = False
+
+    def __call__(self, fvals: torch.Tensor) -> bool:
+        if fvals.numel() != 1:
+            raise ValueError("Stopping requires a scalar training objective")
+        self.step += 1
+        self.improved = False
+        if self.step < self.first_monitored_step:
+            return False
+
+        loss = float(fvals.detach())
+        if loss < self.best_loss - self.min_delta:
+            self.best_loss = loss
+            self.best_step = self.step
+            self.stale_steps = 0
+            self.improved = True
+        else:
+            self.stale_steps += 1
+        self.converged = self.stale_steps >= self.patience
+        return self.converged
 
 
 def as_2d(X: np.ndarray) -> np.ndarray:
@@ -53,25 +100,33 @@ def resolve_hidden_size(input_dim: int, hidden_size: int | None) -> int:
 
 
 class GaussianMLP(nn.Module):
-    """Two-hidden-layer MLP producing a Gaussian mean and variance."""
+    """Two-hidden-layer MLP with an optional heteroscedastic variance head."""
 
     def __init__(
         self,
         input_dim: int,
         hidden_size: int | None = None,
         dropout: float = 0.0,
+        heteroscedastic: bool = True,
     ) -> None:
         super().__init__()
         width = resolve_hidden_size(input_dim, hidden_size)
+        self.heteroscedastic = heteroscedastic
         self.hidden1 = nn.Linear(input_dim, width, dtype=TORCH_DTYPE)
         self.hidden2 = nn.Linear(width, width, dtype=TORCH_DTYPE)
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(width, 2, dtype=TORCH_DTYPE)
+        self.head = nn.Linear(
+            width, 2 if heteroscedastic else 1, dtype=TORCH_DTYPE
+        )
 
     def forward(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden = self.dropout(torch.relu(self.hidden1(X)))
         hidden = self.dropout(torch.relu(self.hidden2(hidden)))
-        mean, raw_variance = self.head(hidden).chunk(2, dim=-1)
+        output = self.head(hidden)
+        if not self.heteroscedastic:
+            mean = output.squeeze(-1)
+            return mean, torch.zeros_like(mean)
+        mean, raw_variance = output.chunk(2, dim=-1)
         variance = torch.nn.functional.softplus(raw_variance) + 1e-6
         return mean.squeeze(-1), variance.squeeze(-1)
 
@@ -80,80 +135,10 @@ def gaussian_nll(mean: torch.Tensor, variance: torch.Tensor, target: torch.Tenso
     return 0.5 * (torch.log(variance) + (target - mean).square() / variance).mean()
 
 
-def train_gaussian_network(
-    model: GaussianMLP,
-    X: np.ndarray,
-    y: np.ndarray,
-    *,
-    learning_rate: float,
-    max_epochs: int,
-    batch_size: int,
-    patience: int,
-    warmup_epochs: int,
-    min_delta: float,
-    validation_fraction: float,
-    seed: int,
-    X_val: np.ndarray | None = None,
-    y_val: np.ndarray | None = None,
-) -> int:
-    """Train using Gaussian NLL and retain the best validation checkpoint."""
-    set_seed(seed)
-    X_tensor = torch.as_tensor(as_2d(X), dtype=TORCH_DTYPE)
-    y_tensor = torch.as_tensor(
-        np.asarray(y, dtype=NUMPY_DTYPE).reshape(-1), dtype=TORCH_DTYPE
-    )
-    generator = torch.Generator().manual_seed(seed)
-    if (X_val is None) != (y_val is None):
-        raise ValueError("X_val and y_val must either both be provided or both be omitted")
-    elif X_val is not None and len(X_val):
-        train_idx = torch.arange(len(X_tensor))
-        X_val_tensor = torch.as_tensor(as_2d(X_val), dtype=TORCH_DTYPE)
-        y_val_tensor = torch.as_tensor(
-            np.asarray(y_val, dtype=NUMPY_DTYPE).reshape(-1), dtype=TORCH_DTYPE
-        )
-        epochs = max_epochs
-    else:
-        order = torch.randperm(len(X_tensor), generator=generator)
-        n_val = (
-            min(max(1, int(round(len(X_tensor) * validation_fraction))), len(X_tensor) - 1)
-            if len(X_tensor) > 1 and validation_fraction > 0.0 else 0
-        )
-        val_idx, train_idx = order[:n_val], order[n_val:]
-        if not len(train_idx):
-            train_idx = order
-        X_val_tensor = X_tensor[val_idx] if n_val else X_tensor[train_idx]
-        y_val_tensor = y_tensor[val_idx] if n_val else y_tensor[train_idx]
-        epochs = max_epochs
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    best_loss, best_state, stale = float("inf"), copy.deepcopy(model.state_dict()), 0
-    best_epoch = 0
-    first_monitored_epoch = min(max(1, warmup_epochs), epochs)
-    for epoch in range(1, epochs + 1):
-        model.train()
-        shuffled = train_idx[torch.randperm(len(train_idx), generator=generator)]
-        for start in range(0, len(shuffled), batch_size):
-            idx = shuffled[start : start + batch_size]
-            optimizer.zero_grad()
-            mean, variance = model(X_tensor[idx])
-            loss = gaussian_nll(mean, variance, y_tensor[idx])
-            loss.backward()
-            optimizer.step()
-
-        if epoch < first_monitored_epoch:
-            continue
-        model.eval()
-        with torch.no_grad():
-            mean, variance = model(X_val_tensor)
-            val_loss = float(gaussian_nll(mean, variance, y_val_tensor))
-        # An epoch only counts as improved when validation NLL drops by min_delta.
-        if val_loss < best_loss - min_delta:
-            best_loss, best_state, stale = val_loss, copy.deepcopy(model.state_dict()), 0
-            best_epoch = epoch
-        else:
-            stale += 1
-            # Stop after the configured number of consecutive non-improving epochs.
-            if stale >= patience:
-                break
-    model.load_state_dict(best_state)
-    return best_epoch
+def moment_match_gaussian_components(
+    means: torch.Tensor, variances: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Moment-match Gaussian components exactly as the public predictors do."""
+    mean = means.mean(dim=0)
+    variance = (variances + means.square()).mean(dim=0) - mean.square()
+    return mean, variance.clamp_min(1e-12)

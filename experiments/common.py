@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sklearn.datasets import fetch_openml
 from ucimlrepo import fetch_ucirepo
 
 from execute_experiment import ModelSpec
@@ -27,20 +28,36 @@ POWER_PLANT_DATASET_NAME = "combined_cycle_power_plant"
 POWER_PLANT_UCI_DATA_ID = 294
 POWER_PLANT_CACHE_PATH = ROOT / ".cache" / "uci" / "power_plant_294.npz"
 
-DATASET_NAMES = [POWER_PLANT_DATASET_NAME, GRID_DATASET_NAME]
+KIN8NM_DATASET_NAME = "kin8nm"
+KIN8NM_OPENML_DATA_ID = 189
+KIN8NM_CACHE_PATH = ROOT / ".cache" / "openml" / "kin8nm_189.npz"
+KIN8NM_SKLEARN_CACHE_PATH = ROOT / ".cache" / "openml" / "sklearn"
+
+DATASET_NAMES = [
+    POWER_PLANT_DATASET_NAME,
+    GRID_DATASET_NAME,
+    KIN8NM_DATASET_NAME,
+]
 UCI_DATA_IDS = {
     POWER_PLANT_DATASET_NAME: POWER_PLANT_UCI_DATA_ID,
     GRID_DATASET_NAME: GRID_UCI_DATA_ID,
 }
+OPENML_DATA_IDS = {KIN8NM_DATASET_NAME: KIN8NM_OPENML_DATA_ID}
 
-VALIDATION_RATIO = 0.2
 N_SPLITS = 20
-MODEL_MAX_EPOCHS = 400
+MAX_TRAINING_EPOCHS = 2000
+EXACT_GP_LEARNING_RATE = 0.05
+DKL_LEARNING_RATE = 0.05
+EARLY_STOPPING_WARMUP = 50
+EARLY_STOPPING_PATIENCE = 5
+EARLY_STOPPING_MIN_DELTA = 1e-4
 NEURAL_LEARNING_RATE = 0.001
-GP_DKL_LEARNING_RATE = 0.01
 DEEP_ENSEMBLE_MEMBERS = 5
-MC_DROPOUT_SAMPLES = 5
+MC_DROPOUT_SAMPLES = 10
+MC_DROPOUT_PROBABILITY = 0.1
 SPARSE_GP_INDUCING_POINTS = (16, 64, 256)
+SPARSE_GP_BATCH_SIZE = 32
+SPARSE_GP_LEARNING_RATE = 0.05
 
 
 def _validate_regression_data(
@@ -109,11 +126,35 @@ def load_electrical_grid_data() -> tuple[np.ndarray, np.ndarray]:
     return X, y
 
 
+@lru_cache(maxsize=1)
+def load_kin8nm_data() -> tuple[np.ndarray, np.ndarray]:
+    """Load, validate, and cache OpenML kin8nm regression data."""
+    if KIN8NM_CACHE_PATH.exists():
+        with np.load(KIN8NM_CACHE_PATH) as cached:
+            X = cached["X"]
+            y = cached["y"]
+    else:
+        X, y = fetch_openml(
+            data_id=KIN8NM_OPENML_DATA_ID,
+            data_home=KIN8NM_SKLEARN_CACHE_PATH,
+            return_X_y=True,
+            as_frame=False,
+            parser="auto",
+        )
+
+    X, y = _validate_regression_data(X, y, KIN8NM_DATASET_NAME)
+    if not KIN8NM_CACHE_PATH.exists():
+        KIN8NM_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(KIN8NM_CACHE_PATH, X=X, y=y)
+    return X, y
+
+
 def load_dataset(dataset_name: str) -> tuple[np.ndarray, np.ndarray]:
-    """Load either shared real-world dataset by name."""
+    """Load a shared real-world benchmark dataset by name."""
     loaders = {
         POWER_PLANT_DATASET_NAME: load_power_plant_data,
         GRID_DATASET_NAME: load_electrical_grid_data,
+        KIN8NM_DATASET_NAME: load_kin8nm_data,
     }
     try:
         return loaders[dataset_name]()
@@ -122,25 +163,48 @@ def load_dataset(dataset_name: str) -> tuple[np.ndarray, np.ndarray]:
 
 
 def build_model_factories(hidden_size: int | None = None) -> dict[str, object]:
-    """Build the seven shared model configurations."""
+    """Build the eight shared model configurations."""
+
+    def exact_gp_factory(X_train, y_train, **kwargs):
+        return ExactGPModel(
+            X_train,
+            y_train,
+            learning_rate=EXACT_GP_LEARNING_RATE,
+            max_iterations=MAX_TRAINING_EPOCHS,
+            warmup_iterations=EARLY_STOPPING_WARMUP,
+            patience=EARLY_STOPPING_PATIENCE,
+            min_delta=EARLY_STOPPING_MIN_DELTA,
+            **kwargs,
+        )
 
     def sparse_gp_factory(X_train, y_train, **kwargs):
         return SparseGPModel(
             X_train,
             y_train,
-            learning_rate=GP_DKL_LEARNING_RATE,
-            max_epochs=MODEL_MAX_EPOCHS,
+            batch_size=SPARSE_GP_BATCH_SIZE,
+            learning_rate=SPARSE_GP_LEARNING_RATE,
+            max_epochs=MAX_TRAINING_EPOCHS,
+            warmup_epochs=EARLY_STOPPING_WARMUP,
+            patience=EARLY_STOPPING_PATIENCE,
+            min_delta=EARLY_STOPPING_MIN_DELTA,
+            **kwargs,
+        )
+
+    def dkl_factory(X_train, y_train, **kwargs):
+        return DKLModel(
+            X_train,
+            y_train,
+            hidden_size=hidden_size,
+            learning_rate=DKL_LEARNING_RATE,
+            max_steps=MAX_TRAINING_EPOCHS,
+            warmup_steps=EARLY_STOPPING_WARMUP,
+            patience=EARLY_STOPPING_PATIENCE,
+            min_delta=EARLY_STOPPING_MIN_DELTA,
             **kwargs,
         )
 
     factories: dict[str, object] = {
-        "exact_gp": lambda X_train, y_train, **kwargs: ExactGPModel(
-            X_train,
-            y_train,
-            learning_rate=GP_DKL_LEARNING_RATE,
-            max_epochs=MODEL_MAX_EPOCHS,
-            **kwargs,
-        ),
+        "exact_gp": exact_gp_factory,
     }
     for n_inducing in SPARSE_GP_INDUCING_POINTS:
         factories[f"sparse_gp_m{n_inducing}"] = ModelSpec(
@@ -154,26 +218,41 @@ def build_model_factories(hidden_size: int | None = None) -> dict[str, object]:
                 n_members=DEEP_ENSEMBLE_MEMBERS,
                 hidden_size=hidden_size,
                 learning_rate=NEURAL_LEARNING_RATE,
-                max_epochs=MODEL_MAX_EPOCHS,
+                max_epochs=MAX_TRAINING_EPOCHS,
+                warmup_epochs=EARLY_STOPPING_WARMUP,
+                patience=EARLY_STOPPING_PATIENCE,
+                min_delta=EARLY_STOPPING_MIN_DELTA,
                 **kwargs,
             ),
             "mc_dropout": lambda X_train, y_train, **kwargs: MCDropoutModel(
                 X_train,
                 y_train,
                 n_samples=MC_DROPOUT_SAMPLES,
+                dropout_probability=MC_DROPOUT_PROBABILITY,
                 hidden_size=hidden_size,
                 learning_rate=NEURAL_LEARNING_RATE,
-                max_epochs=MODEL_MAX_EPOCHS,
+                max_epochs=MAX_TRAINING_EPOCHS,
+                warmup_epochs=EARLY_STOPPING_WARMUP,
+                patience=EARLY_STOPPING_PATIENCE,
+                min_delta=EARLY_STOPPING_MIN_DELTA,
+                heteroscedastic=True,
                 **kwargs,
             ),
-            "dkl": lambda X_train, y_train, **kwargs: DKLModel(
-                X_train,
-                y_train,
-                hidden_size=hidden_size,
-                learning_rate=GP_DKL_LEARNING_RATE,
-                max_epochs=MODEL_MAX_EPOCHS,
-                **kwargs,
+            "mc_dropout_standard": lambda X_train, y_train, **kwargs: MCDropoutModel(
+               X_train,
+               y_train,
+               n_samples=MC_DROPOUT_SAMPLES,
+               dropout_probability=MC_DROPOUT_PROBABILITY,
+               hidden_size=hidden_size,
+               learning_rate=NEURAL_LEARNING_RATE,
+               max_epochs=MAX_TRAINING_EPOCHS,
+               warmup_epochs=EARLY_STOPPING_WARMUP,
+               patience=EARLY_STOPPING_PATIENCE,
+               min_delta=EARLY_STOPPING_MIN_DELTA,
+               heteroscedastic=False,
+               **kwargs,
             ),
+            "dkl": dkl_factory,
         }
     )
     return factories
@@ -181,13 +260,24 @@ def build_model_factories(hidden_size: int | None = None) -> dict[str, object]:
 
 __all__ = [
     "DATASET_NAMES",
+    "DKL_LEARNING_RATE",
+    "EARLY_STOPPING_MIN_DELTA",
+    "EARLY_STOPPING_PATIENCE",
+    "EARLY_STOPPING_WARMUP",
+    "EXACT_GP_LEARNING_RATE",
     "GRID_DATASET_NAME",
+    "KIN8NM_DATASET_NAME",
+    "MAX_TRAINING_EPOCHS",
+    "MC_DROPOUT_PROBABILITY",
     "N_SPLITS",
+    "OPENML_DATA_IDS",
     "POWER_PLANT_DATASET_NAME",
+    "SPARSE_GP_BATCH_SIZE",
+    "SPARSE_GP_LEARNING_RATE",
     "UCI_DATA_IDS",
-    "VALIDATION_RATIO",
     "build_model_factories",
     "load_dataset",
     "load_electrical_grid_data",
+    "load_kin8nm_data",
     "load_power_plant_data",
 ]

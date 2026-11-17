@@ -1,4 +1,4 @@
-"""Experiment 1: benchmark UCI Power Plant and Electrical Grid Stability."""
+"""Experiment 1: learning curves on three real-world regression datasets."""
 
 from __future__ import annotations
 
@@ -15,20 +15,23 @@ from execute_experiment import count_experiment_jobs, execute_experiment
 from experiments.common import (
     DATASET_NAMES,
     N_SPLITS,
+    OPENML_DATA_IDS,
     UCI_DATA_IDS,
-    VALIDATION_RATIO,
     build_model_factories,
     load_dataset,
 )
 
 
-TRAIN_FRACTION = 0.8
-TRAIN_SIZES = [50, 100, 200, 400, 800, 1_600]
-OUTPUT_PATH = ROOT / "results" / "tables" / "experiment_1.csv"
+TRAIN_FRACTION = 0.8 
+TRAIN_SIZES = [50, 100, 200, 400, 800, 1_600, 3200]
 
 
-def power_plant_grid_dataset(dataset_name: str, random_seed: int = 0):
-    """Create one reproducible 80/20 partition for either benchmark dataset."""
+
+OUTPUT_PATH = ROOT / "results" / "tables" / "experiment_1_lr_05_2.csv"
+
+
+def benchmark_dataset(dataset_name: str, random_seed: int = 0):
+    """Create one reproducible 80/20 partition for a benchmark dataset."""
     X, y = load_dataset(dataset_name)
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -47,14 +50,20 @@ def power_plant_grid_dataset(dataset_name: str, random_seed: int = 0):
     }
 
 
-def dataset_metadata() -> dict[str, dict[str, int]]:
+def dataset_metadata() -> dict[str, dict[str, int | str | None]]:
     """Derive dataset dimensions and split sizes from the loaded data."""
     metadata = {}
     for dataset_name in DATASET_NAMES:
         X, _ = load_dataset(dataset_name)
-        split = power_plant_grid_dataset(dataset_name, random_seed=0)
+        split = benchmark_dataset(dataset_name, random_seed=0)
+        repository = "openml" if dataset_name in OPENML_DATA_IDS else "uci"
         metadata[dataset_name] = {
-            "uci_data_id": UCI_DATA_IDS[dataset_name],
+            "data_repository": repository,
+            "data_id": (
+                OPENML_DATA_IDS[dataset_name]
+                if repository == "openml"
+                else UCI_DATA_IDS[dataset_name]
+            ),
             "total_observations": len(X),
             "n_features": X.shape[1],
             "train_pool_size": len(split["X_train"]),
@@ -87,8 +96,7 @@ def run_experiment_1() -> None:
         dataset_names=DATASET_NAMES,
         train_sizes=TRAIN_SIZES,
         n_splits=N_SPLITS,
-        dataset_loader=power_plant_grid_dataset,
-        validation_ratio=VALIDATION_RATIO,
+        dataset_loader=benchmark_dataset,
         verbose=True,
     )
 
@@ -108,9 +116,16 @@ def run_experiment_1() -> None:
     )
     result_df.insert(
         5,
-        "uci_data_id",
+        "data_repository",
         result_df["dataset"].map(
-            {name: spec["uci_data_id"] for name, spec in metadata.items()}
+            {name: spec["data_repository"] for name, spec in metadata.items()}
+        ),
+    )
+    result_df.insert(
+        6,
+        "data_id",
+        result_df["dataset"].map(
+            {name: spec["data_id"] for name, spec in metadata.items()}
         ),
     )
 

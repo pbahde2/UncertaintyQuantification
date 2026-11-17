@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import copy
+from functools import partial
+
 import numpy as np
 import torch
+from botorch.fit import fit_gpytorch_mll, fit_gpytorch_mll_torch
 from botorch.models import SingleTaskGP
 from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.likelihoods import GaussianLikelihood
@@ -12,11 +15,10 @@ from gpytorch.means import ConstantMean
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
 from ._common import (
-    DEFAULT_LEARNING_RATE,
     TORCH_DTYPE,
     TargetStandardizer,
+    TrainingObjectiveStoppingCriterion,
     as_2d,
-    gaussian_nll,
     set_seed,
 )
 
@@ -24,86 +26,92 @@ from ._common import (
 class ExactGPModel:
     """Matérn-5/2 ARD GP with learned output scale and observation noise."""
 
-    def __init__(self, X_train: np.ndarray, y_train: np.ndarray,
-                 learning_rate: float = DEFAULT_LEARNING_RATE, max_epochs: int = 400,
-                 patience: int = 5, warmup_epochs: int = 50,
-                 min_delta: float = 1e-4, random_seed: int = 0,
-                 X_val: np.ndarray | None = None, y_val: np.ndarray | None = None,
-                 **_: object):
-        self.learning_rate, self.max_epochs = learning_rate, max_epochs
-        self.patience, self.warmup_epochs = patience, warmup_epochs
-        self.min_delta, self.random_seed = min_delta, random_seed
-        self.fit(X_train, y_train, X_val=X_val, y_val=y_val)
+    def __init__(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        learning_rate: float = 0.01,
+        max_iterations: int = 400,
+        warmup_iterations: int = 50,
+        patience: int = 5,
+        min_delta: float = 1e-4,
+        random_seed: int = 0,
+    ) -> None:
+        if (
+            learning_rate <= 0
+            or max_iterations <= 0
+            or warmup_iterations <= 0
+            or patience <= 0
+            or min_delta < 0
+        ):
+            raise ValueError(
+                "learning_rate, max_iterations, warmup_iterations, and patience must "
+                "be positive and min_delta must be non-negative"
+            )
+        self.learning_rate = learning_rate
+        self.max_iterations = max_iterations
+        self.warmup_iterations = warmup_iterations
+        self.patience = patience
+        self.min_delta = min_delta
+        self.random_seed = random_seed
+        self.fit(X_train, y_train)
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray,
-            X_val: np.ndarray | None = None,
-            y_val: np.ndarray | None = None) -> "ExactGPModel":
+    def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> "ExactGPModel":
         set_seed(self.random_seed)
         self.target_scaler = TargetStandardizer.fit(y_train)
         train_x = torch.as_tensor(as_2d(X_train), dtype=TORCH_DTYPE)
         train_y = torch.as_tensor(
             self.target_scaler.transform(y_train), dtype=TORCH_DTYPE
         ).unsqueeze(-1)
-        if (X_val is None) != (y_val is None):
-            raise ValueError("X_val and y_val must either both be provided or both be omitted")
-        val_x = (
-            torch.as_tensor(as_2d(X_val), dtype=TORCH_DTYPE)
-            if X_val is not None and len(X_val) else None
-        )
-        val_y = (
-            torch.as_tensor(self.target_scaler.transform(y_val), dtype=TORCH_DTYPE)
-            if val_x is not None else None
-        )
-        #define kernel
+        # Define kernel.
         kernel = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=train_x.shape[-1]))
         likelihood = GaussianLikelihood()
         likelihood.noise = 0.1
-        #define model
+        # Define model.
         self.model = SingleTaskGP(
             train_x, train_y, likelihood=likelihood,
             covar_module=kernel, mean_module=ConstantMean()
         )
         self.likelihood = self.model.likelihood
-        #hyperparameter optimization
+        # Fit through BoTorch's dispatcher while explicitly using its torch path.
         self.model.train()
         self.likelihood.train()
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         objective = ExactMarginalLogLikelihood(self.likelihood, self.model)
-        best_loss, best_epoch = float("inf"), 0
+        stopping_criterion = TrainingObjectiveStoppingCriterion(
+            first_monitored_step=min(
+                self.warmup_iterations, self.max_iterations
+            ),
+            patience=self.patience,
+            min_delta=self.min_delta,
+        )
         best_state = copy.deepcopy(self.model.state_dict())
-        stale = 0
-        first_monitored_epoch = min(max(1, self.warmup_epochs), self.max_epochs)
-        for epoch in range(1, self.max_epochs + 1):
-            optimizer.zero_grad()
-            loss = -objective(self.model(train_x), train_y.squeeze(-1))
-            loss.backward()
-            optimizer.step()
-            if val_x is not None and epoch >= first_monitored_epoch:
-                self.model.eval()
-                self.likelihood.eval()
-                with torch.no_grad():
-                    predictive = self.likelihood(self.model(val_x))
-                    selection_loss = float(
-                        gaussian_nll(predictive.mean, predictive.variance, val_y)
-                    )
-                self.model.train()
-                self.likelihood.train()
-                # Keep the epoch only when validation NLL improves by at least min_delta.
-                if selection_loss < best_loss - self.min_delta:
-                    best_loss = selection_loss
-                    best_state = copy.deepcopy(self.model.state_dict())
-                    best_epoch = epoch
-                    stale = 0
-                else:
-                    stale += 1
-                    # Five consecutive non-improving epochs trigger stopping by default.
-                    if stale >= self.patience:
-                        break
-        if val_x is not None:
-            self.model.load_state_dict(best_state)
-            self.best_epoch_ = best_epoch
-        else:
-            self.best_epoch_ = self.max_epochs
+
+        def retain_best_state(parameters, result) -> None:
+            del parameters, result
+            nonlocal best_state
+            if stopping_criterion.improved:
+                best_state = copy.deepcopy(self.model.state_dict())
+
+        fit_gpytorch_mll(
+            objective,
+            optimizer=fit_gpytorch_mll_torch,
+            optimizer_kwargs={
+                "step_limit": self.max_iterations,
+                "optimizer": partial(torch.optim.Adam, lr=self.learning_rate),
+                "stopping_criterion": stopping_criterion,
+                "callback": retain_best_state,
+            },
+            max_attempts=1,
+        )
+        self.model.load_state_dict(best_state)
+        self.best_epoch_ = stopping_criterion.best_step
+        self.training_objective_ = stopping_criterion.best_loss
+        self.optimization_steps_ = stopping_criterion.step
+        # Exact-GP optimization is full-batch: one step is one epoch.
+        self.optimization_epochs_ = stopping_criterion.step
+        self.optimization_status_ = (
+            "converged" if stopping_criterion.converged else "max_iterations"
+        )
         self.model.eval()
         self.likelihood.eval()
         return self

@@ -21,7 +21,6 @@ if str(ROOT) not in sys.path:
 from execute_experiment import count_experiment_jobs, execute_experiment
 from experiments.common import (
     N_SPLITS,
-    VALIDATION_RATIO,
     build_model_factories,
     load_power_plant_data,
 )
@@ -31,18 +30,14 @@ SYNTHETIC_DATASET_NAME = "synthetic_ood"
 POWER_PLANT_DATASET_NAME = "power_plant_ood"
 DATASET_NAMES = [SYNTHETIC_DATASET_NAME, POWER_PLANT_DATASET_NAME]
 
-SYNTHETIC_TRAIN_SIZE = 300
+SYNTHETIC_TRAIN_SIZE = 100
 POWER_PLANT_TRAIN_SIZE = 400
 TRAIN_SIZES_BY_DATASET = {
     SYNTHETIC_DATASET_NAME: SYNTHETIC_TRAIN_SIZE,
     POWER_PLANT_DATASET_NAME: POWER_PLANT_TRAIN_SIZE,
 }
-SYNTHETIC_VALIDATION_SIZE = int(np.ceil(VALIDATION_RATIO * SYNTHETIC_TRAIN_SIZE))
-POWER_PLANT_VALIDATION_SIZE = int(
-    np.ceil(VALIDATION_RATIO * POWER_PLANT_TRAIN_SIZE)
-)
 
-SYNTHETIC_TEST_SIZE = 1_000
+SYNTHETIC_TEST_SIZE = 500
 TRAIN_BOUND = 3.0
 TEST_BOUND = 5.0
 NOISE_STD = 0.2
@@ -69,16 +64,15 @@ def synthetic_ood_dataset(
     dataset_name: str = SYNTHETIC_DATASET_NAME,
     random_seed: int = RANDOM_SEED,
 ) -> dict[str, np.ndarray]:
-    """Generate fitting/validation observations and an evenly spaced test set."""
+    """Generate one fixed training label budget and an evenly spaced test set."""
     if dataset_name != SYNTHETIC_DATASET_NAME:
         raise ValueError(f"Unsupported dataset: {dataset_name!r}")
 
     rng = np.random.default_rng(random_seed)
-    train_pool_size = SYNTHETIC_TRAIN_SIZE + SYNTHETIC_VALIDATION_SIZE
-    X_train = rng.uniform(-TRAIN_BOUND, TRAIN_BOUND, size=(train_pool_size, 1))
+    X_train = rng.uniform(-TRAIN_BOUND, TRAIN_BOUND, size=(SYNTHETIC_TRAIN_SIZE, 1))
     X_test = np.linspace(-TEST_BOUND, TEST_BOUND, SYNTHETIC_TEST_SIZE).reshape(-1, 1)
     y_train = latent_function(X_train[:, 0]) + NOISE_STD * rng.normal(
-        size=train_pool_size
+        size=SYNTHETIC_TRAIN_SIZE
     )
     y_test = latent_function(X_test[:, 0]) + NOISE_STD * rng.normal(
         size=SYNTHETIC_TEST_SIZE
@@ -119,9 +113,8 @@ def power_plant_ood_dataset(
 
     X, y = load_power_plant_data()
     id_indices, ood_indices = power_plant_id_ood_indices(X)
-    train_pool_size = POWER_PLANT_TRAIN_SIZE + POWER_PLANT_VALIDATION_SIZE
     rng = np.random.default_rng(random_seed)
-    train_indices = rng.choice(id_indices, size=train_pool_size, replace=False)
+    train_indices = rng.choice(id_indices, size=POWER_PLANT_TRAIN_SIZE, replace=False)
     remaining_id_indices = np.setdiff1d(id_indices, train_indices, assume_unique=True)
     test_indices = np.concatenate([remaining_id_indices, ood_indices])
 
@@ -181,7 +174,7 @@ class PredictionCollector:
         feature_scaler: object,
         **_: object,
     ) -> None:
-        """Collect one synthetic seed's predictions and fitting observations."""
+        """Collect one synthetic seed's predictions and complete training subset."""
         if dataset_name != SYNTHETIC_DATASET_NAME:
             return
         mean, variance = model.predict(feature_scaler.transform(self.grid))
@@ -263,7 +256,6 @@ def _run_dataset(
         train_sizes=[TRAIN_SIZES_BY_DATASET[dataset_name]],
         n_splits=N_SPLITS,
         dataset_loader=experiment_2_dataset,
-        validation_ratio=VALIDATION_RATIO,
         test_region_key="test_region",
         fitted_model_callback=callback,
         verbose=True,

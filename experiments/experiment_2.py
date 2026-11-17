@@ -43,8 +43,8 @@ TEST_BOUND = 5.0
 NOISE_STD = 0.2
 SYNTHETIC_NN_HIDDEN_SIZE = 10
 
-RESULT_PATH = ROOT / "results" / "tables" / "experiment_2_new2.csv"
-FIGURE_DIRECTORY = ROOT / "results" / "figures" / "experiment_2_new2"
+RESULT_PATH = ROOT / "results" / "tables" / "experiment_2_new.csv"
+FIGURE_DIRECTORY = ROOT / "results" / "figures" / "experiment_2_new"
 
 RANDOM_SEED = 0
 

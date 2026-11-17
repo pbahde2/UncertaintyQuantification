@@ -27,7 +27,7 @@ TRAIN_SIZES = [50, 100, 200, 400, 800, 1_600, 3200]
 
 
 
-OUTPUT_PATH = ROOT / "results" / "tables" / "experiment_1_lr_05_2.csv"
+OUTPUT_PATH = ROOT / "results" / "tables" / "experiment_1_new.csv"
 
 
 def benchmark_dataset(dataset_name: str, random_seed: int = 0):

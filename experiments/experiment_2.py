@@ -197,47 +197,57 @@ class PredictionCollector:
                 np.maximum(mixture_variance, 1e-12)
             )
 
-            figure, axis = plt.subplots(figsize=(9, 5.5))
-            axis.axvspan(-TEST_BOUND, -TRAIN_BOUND, color="#f4a261", alpha=0.16)
-            axis.axvspan(
-                TRAIN_BOUND, TEST_BOUND, color="#f4a261", alpha=0.16, label="OOD"
-            )
-            axis.axvspan(
-                -TRAIN_BOUND, TRAIN_BOUND, color="#2a9d8f", alpha=0.08, label="ID"
-            )
-            for split_idx, (X_train, y_train) in self.training_sets.items():
-                axis.scatter(
-                    X_train[:, 0], y_train, s=5, color="#64748b", alpha=0.035,
-                    label="Training observations" if split_idx == 0 else None,
-                    zorder=2,
-                )
+            figure, axis = plt.subplots(figsize=(8.0, 4.6))
+            figure.patch.set_facecolor("white")
+            axis.set_facecolor("white")
             axis.plot(
                 self.grid[:, 0], latent_function(self.grid[:, 0]), color="black",
-                linewidth=2, label="True function", zorder=5,
+                linewidth=1.7, label="True function", zorder=5,
             )
             axis.plot(
-                self.grid[:, 0], mixture_mean, color="#1d4ed8", linewidth=2.2,
+                self.grid[:, 0], mixture_mean, color="#910730", linewidth=1.8,
                 label="Mean prediction across seeds", zorder=4,
             )
             axis.fill_between(
                 self.grid[:, 0], mixture_mean - interval_radius,
-                mixture_mean + interval_radius, color="#60a5fa", alpha=0.3,
+                mixture_mean + interval_radius, color="#910730", alpha=0.16,
                 label="Nominal 90% prediction interval", zorder=1,
             )
-            axis.axvline(-TRAIN_BOUND, color="#9a3412", linestyle="--", linewidth=1.4)
-            axis.axvline(TRAIN_BOUND, color="#9a3412", linestyle="--", linewidth=1.4)
-            axis.set(
-                xlim=(-TEST_BOUND, TEST_BOUND), xlabel="x", ylabel="y",
-                title=f"Synthetic ID/OOD prediction: {model_name}",
+            axis.axvline(
+                -TRAIN_BOUND, color="#143163", linestyle=(0, (4, 2)),
+                linewidth=1.2, label="ID/OOD boundary", zorder=3,
             )
-            axis.grid(alpha=0.2)
+            axis.axvline(
+                TRAIN_BOUND, color="#143163", linestyle=(0, (4, 2)),
+                linewidth=1.2, zorder=3,
+            )
+            axis.set(
+                xlim=(-TEST_BOUND, TEST_BOUND),
+                xlabel="Input x", ylabel="Target y",
+            )
+            axis.xaxis.label.set_size(8.2)
+            axis.yaxis.label.set_size(8.2)
+            axis.tick_params(axis="both", labelsize=7.5, length=3)
+            axis.grid(True, which="major", color="0.88", linewidth=0.55)
+            axis.grid(False, which="minor")
+            for spine in axis.spines.values():
+                spine.set_linewidth(0.7)
+                spine.set_color("0.35")
             handles, labels = axis.get_legend_handles_labels()
             unique = dict(zip(labels, handles))
-            axis.legend(unique.values(), unique.keys(), loc="best", fontsize=8)
-            figure.tight_layout()
+            figure.legend(
+                unique.values(), unique.keys(), loc="upper center",
+                bbox_to_anchor=(0.5, 0.99), ncol=len(unique), frameon=False,
+                columnspacing=1.0, handlelength=2.2, fontsize=7.5,
+            )
+            figure.subplots_adjust(
+                top=0.87, bottom=0.14, left=0.10, right=0.985
+            )
 
             output_path = self.output_directory / f"{model_name}.png"
-            figure.savefig(output_path, dpi=180)
+            pdf_path = self.output_directory / f"{model_name}.pdf"
+            figure.savefig(output_path, dpi=300, bbox_inches="tight")
+            figure.savefig(pdf_path, bbox_inches="tight")
             plt.close(figure)
             output_paths.append(output_path)
         return output_paths
